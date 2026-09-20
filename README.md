@@ -46,8 +46,9 @@ Create a .env file in the project root:
     RPC_URL_ROBINHOOD=https://...
     OPENSEA_RPS=2
     LIST_CONCURRENCY=3
+    HOLDINGS_LOOKBACK_MINUTES=180
 
-OPENSEA_RPS and LIST_CONCURRENCY are optional, see Speed and rate limits below.
+OPENSEA_RPS, LIST_CONCURRENCY and HOLDINGS_LOOKBACK_MINUTES are optional, see Speed and rate limits and Holdings below.
 
 PRIVATE_KEYS is a comma separated list. Only the RPC URLs for chains you actually use are needed. If a chain has no RPC URL, the bot aborts that session with a message.
 
@@ -73,6 +74,18 @@ Then open your bot in Telegram and send /start.
 
 Sessions time out after 3 minutes of inactivity.
 
+## Holdings
+
+Holdings are verified on chain, because OpenSea's indexer lags by minutes in both directions (sold NFTs keep showing up, fresh mints are missing).
+
+For each wallet the bot reads balanceOf on chain, then uses OpenSea only to find candidates and confirms every candidate with ownerOf. If fewer NFTs are confirmed than balanceOf says, the missing ones are looked up through ERC721Enumerable when the contract supports it, otherwise through recent Transfer events. HOLDINGS_LOOKBACK_MINUTES (default 180) is how far back that log scan goes, and it stops as soon as the count matches balanceOf.
+
+If the wallet screen still cannot find every NFT (for example an old NFT that OpenSea has not indexed, on a contract without enumeration, or an RPC that rejects log queries), it prints a note with the on-chain balance instead of silently showing an incomplete list.
+
+Manage Listing hides listings of tokens the wallet no longer owns.
+
+Only ERC721 is supported.
+
 ## Speed and rate limits
 
 All OpenSea requests go through one shared limiter, because OpenSea limits per API key.
@@ -94,7 +107,7 @@ The .env file holds raw private keys. Never commit it (it is already in .gitigno
 
 ## Notes and limitations
 
-Wallet holdings are fetched with a limit of 50 NFTs per wallet, so larger holdings are not fully shown.
+The wallet RPC must be reachable at all times. If it is down, the wallet screen fails with an error instead of showing a possibly stale list.
 If a wallet has not approved the OpenSea conduit for the collection yet, the bot estimates the approval gas cost in the summary. Approval gas is paid from that wallet.
 Close and Reprice use OpenSea's off chain cancellation. This removes the listing from OpenSea but does not invalidate the signed order on chain.
 Reprice cancels first and then relists. If the relist fails, the token ends up with no active listing.

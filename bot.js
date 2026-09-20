@@ -2,6 +2,7 @@ require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const opensea = require('./lib/opensea');
+const holdings = require('./lib/holdings');
 const sessionStore = require('./lib/session');
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -299,11 +300,33 @@ async function handleStep(chatId, session, text) {
       for (const pk of PRIVATE_KEYS) {
         const wallet = new ethers.Wallet(pk, session.data.provider);
         const sdk = opensea.makeSdk(wallet, chain, OPENSEA_API_KEY);
-        const items = session.flow === 'list'
-          ? await opensea.getOwnedTokenIds(sdk, wallet.address, session.data.contractAddress)
-          : await opensea.getOpenListings(sdk, wallet.address, slug, session.data.contractAddress, chain);
+        const notes = [];
+        let items;
 
-        walletsData.push({ wallet, items });
+        if (session.flow === 'list') {
+          // On-chain is the source of truth. OpenSea's indexer lags (sold NFTs linger, fresh mints
+          // are missing), so it is only used to find candidates that are then verified on-chain.
+          const result = await holdings.getHoldings({
+            provider: session.data.provider,
+            contractAddress: session.data.contractAddress,
+            wallet: wallet.address,
+            loadCandidates: (balance) => opensea.getOwnedTokenIds(sdk, wallet.address, session.data.contractAddress, { stopAt: balance }),
+          });
+          items = result.ids;
+          notes.push(...result.warnings);
+          if (result.complete === false) {
+            notes.push(`on-chain balance is ${result.balance} but only ${result.ids.length} found, recent NFTs may be missing`);
+          }
+        } else {
+          const listings = await opensea.getOpenListings(sdk, wallet.address, slug, session.data.contractAddress, chain);
+          const verified = await holdings.filterOwned(session.data.provider, session.data.contractAddress, wallet.address, listings, (l) => l.tokenId);
+          items = verified.items;
+          if (verified.removed > 0) {
+            notes.push(`${verified.removed} stale listing(s) hidden, token no longer owned`);
+          }
+        }
+
+        walletsData.push({ wallet, items, notes });
       }
 
       session.data.walletsData = walletsData;
@@ -312,6 +335,7 @@ async function handleStep(chatId, session, text) {
       let menuText = '';
       walletsData.forEach((w, i) => {
         menuText += `${i + 1}. ${w.wallet.address} ${verb} ${w.items.length} NFT(s) from this collection\n`;
+        w.notes.forEach((note) => { menuText += `   note: ${note}\n`; });
       });
       bot.sendMessage(chatId, menuText.trim());
 
