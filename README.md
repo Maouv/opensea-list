@@ -20,7 +20,7 @@ ethereum, polygon, base, arc, robinhood
 
 ## Requirements
 
-Node.js 18 or newer (the bot uses the built in fetch)
+Node.js 22 or newer (required by @opensea/sdk)
 A Telegram bot token from BotFather
 Your Telegram numeric user ID
 An OpenSea API key
@@ -44,6 +44,10 @@ Create a .env file in the project root:
     RPC_URL_BASE=https://...
     RPC_URL_ARC=https://...
     RPC_URL_ROBINHOOD=https://...
+    OPENSEA_RPS=2
+    LIST_CONCURRENCY=3
+
+OPENSEA_RPS and LIST_CONCURRENCY are optional, see Speed and rate limits below.
 
 PRIVATE_KEYS is a comma separated list. Only the RPC URLs for chains you actually use are needed. If a chain has no RPC URL, the bot aborts that session with a message.
 
@@ -58,16 +62,29 @@ Then open your bot in Telegram and send /start.
 1. Choose Listing or Manage Listing from the menu.
 2. For Manage Listing, choose Reprice or Close.
 3. Send the collection contract address.
-4. Send the chain name, or leave it blank for ethereum.
+4. Send the chain name, or d for ethereum.
 5. Pick a wallet by number, or send all.
 6. Send how many NFTs to process for each wallet. Send 0 to skip a wallet.
 7. For Listing and Reprice, send the price. Accepted formats:
    a number, for example 0.05
    a percentage relative to floor, for example -40%
-   blank, which means floor price minus 10%
+   d, which means floor price minus 10%
 8. Review the summary and press Yes to execute.
 
 Sessions time out after 3 minutes of inactivity.
+
+## Speed and rate limits
+
+All OpenSea requests go through one shared limiter, because OpenSea limits per API key.
+
+OPENSEA_RPS is the maximum number of OpenSea requests per second (default 2). A listing costs about 2 requests, so the ceiling is roughly OPENSEA_RPS divided by 2 listings per second.
+LIST_CONCURRENCY is how many listings run at the same time (default 3). It hides latency, it cannot exceed OPENSEA_RPS.
+
+If OpenSea answers 429, the limiter pauses every request for the Retry-After time, halves the rate, then climbs back to OPENSEA_RPS after a streak of successful requests.
+
+To find your real limit, raise OPENSEA_RPS step by step and watch the "OpenSea rate limited" line in the final summary. Stop when it stops being 0. Limits depend on your API key type, permanent keys get higher limits than temporary ones.
+
+While a batch runs the bot edits one progress message instead of sending a message per token. The final message lists failures grouped by error.
 
 ## Security
 
@@ -81,4 +98,4 @@ Wallet holdings are fetched with a limit of 50 NFTs per wallet, so larger holdin
 If a wallet has not approved the OpenSea conduit for the collection yet, the bot estimates the approval gas cost in the summary. Approval gas is paid from that wallet.
 Close and Reprice use OpenSea's off chain cancellation. This removes the listing from OpenSea but does not invalidate the signed order on chain.
 Reprice cancels first and then relists. If the relist fails, the token ends up with no active listing.
-A 3 second delay is applied between tokens to avoid API rate limits.
+The wallet RPC also receives one ownership check per token, so a slow or limited RPC can become the bottleneck at high speed.

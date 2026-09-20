@@ -8,7 +8,7 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const AUTHORIZED_USER_ID = process.env.TELEGRAM_USER_ID;
 const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY;
 const PRIVATE_KEYS = process.env.PRIVATE_KEYS.split(',').map((k) => k.trim());
-const DELAY_MS = 3000;
+const CONCURRENCY = Math.max(1, parseInt(process.env.LIST_CONCURRENCY, 10) || 3);
 const LISTING_DURATION_DAYS = 7;
 
 const RPC_URLS = {
@@ -21,22 +21,34 @@ const RPC_URLS = {
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+// Telegram calls are mostly fire-and-forget. A network blip (ECONNRESET/ETIMEDOUT) must be
+// logged, not left as an unhandled rejection.
+for (const method of ['sendMessage', 'answerCallbackQuery', 'editMessageText']) {
+  const original = bot[method].bind(bot);
+  bot[method] = (...args) => Promise.resolve(original(...args)).catch((err) => {
+    console.log(`${method} failed:`, err.message);
+  });
 }
 
 function isAuthorized(id) {
   return String(id) === String(AUTHORIZED_USER_ID);
 }
 
-function endAndReturnToMenu(chatId) {
-  sessionStore.endSession(chatId);
-  showMainMenu(chatId);
+function isBusy(chatId) {
+  const s = sessionStore.getSession(chatId);
+  return Boolean(s && s.step === 'executing');
 }
 
-function showMainMenu(chatId) {
-  sessionStore.setSession(chatId, { flow: null, step: 'main_menu', data: {} }, bot);
-  bot.sendMessage(chatId, 'What do you want to do?', {
+function endAndReturnToMenu(chatId, notice) {
+  sessionStore.endSession(chatId);
+  showMainMenu(chatId, notice);
+}
+
+function showMainMenu(chatId, notice) {
+  // idle: the menu is a resting state, it has no inactivity timer
+  sessionStore.setSession(chatId, { flow: null, step: 'main_menu', data: {} }, bot, { idle: true });
+  const text = notice ? `${notice}\n\nWhat do you want to do?` : 'What do you want to do?';
+  bot.sendMessage(chatId, text, {
     reply_markup: {
       inline_keyboard: [[
         { text: 'Listing', callback_data: 'menu_listing' },
@@ -73,8 +85,7 @@ function finalizeWalletSelection(chatId, session, wallet, count, price) {
 
 async function goToSummary(chatId, session) {
   if (session.data.selections.length === 0) {
-    bot.sendMessage(chatId, 'Nothing selected, aborting');
-    endAndReturnToMenu(chatId);
+    endAndReturnToMenu(chatId, 'Nothing selected, aborting');
     return;
   }
 
@@ -112,60 +123,123 @@ async function goToSummary(chatId, session) {
   sessionStore.setSession(chatId, session, bot);
 }
 
-async function executeAction(chatId, session) {
-  bot.sendMessage(chatId, 'Executing...');
-  let successCount = 0;
-  let skippedCount = 0;
-  const expirationTime = Math.round(Date.now() / 1000 + 60 * 60 * 24 * LISTING_DURATION_DAYS);
+// Sends up to CONCURRENCY listings at once. The OpenSea request rate itself is capped by the shared
+// limiter in lib/opensea.js, so more concurrency only hides latency, it cannot exceed the limit.
+async function runPool(jobs, worker, limit) {
+  let next = 0;
+  const runners = Array.from({ length: Math.min(limit, jobs.length) }, async () => {
+    while (next < jobs.length) {
+      const job = jobs[next];
+      next += 1;
+      await worker(job);
+    }
+  });
+  await Promise.all(runners);
+}
 
-  for (const selection of session.data.selections) {
-    const sdk = opensea.makeSdk(selection.wallet, session.data.chain, OPENSEA_API_KEY);
+async function processItem(chatId, session, job, expirationTime) {
+  const { selection, sdk, item } = job;
+  // heartbeat: a long batch must not hit the 3 minute inactivity timeout mid-run
+  sessionStore.setSession(chatId, session, bot);
 
-    for (const item of selection.items) {
-      const tokenId = session.flow === 'list' ? item : item.tokenId;
+  const tokenId = session.flow === 'list' ? item : item.tokenId;
+  const base = { wallet: selection.wallet.address, tokenId };
+  let cancelled = false;
 
-      const stillOwned = await opensea.checkStillOwned(session.data.contractAddress, tokenId, selection.wallet.address, session.data.provider);
+  try {
+    const stillOwned = await opensea.checkStillOwned(session.data.contractAddress, tokenId, selection.wallet.address, session.data.provider);
+    if (!stillOwned) return { ...base, status: 'skipped' };
 
-      if (!stillOwned) {
-        bot.sendMessage(chatId, `Token ${tokenId} no longer owned by ${selection.wallet.address}, likely sold — skipped`);
-        skippedCount += 1;
-        await sleep(DELAY_MS);
-        continue;
-      }
+    const listingParams = {
+      asset: { tokenId, tokenAddress: session.data.contractAddress },
+      accountAddress: selection.wallet.address,
+      amount: selection.price,
+      expirationTime,
+    };
 
-      try {
-        if (session.flow === 'list') {
-          await sdk.createListing({
-            asset: { tokenId, tokenAddress: session.data.contractAddress },
-            accountAddress: selection.wallet.address,
-            amount: selection.price,
-            expirationTime,
-          });
-          bot.sendMessage(chatId, `${selection.wallet.address} listed token ${tokenId} at ${selection.price}`);
-        } else if (session.mode === 'close') {
-          await sdk.api.orders.offchainCancelOrder(item.protocolAddress, item.orderHash, session.data.chain);
-          bot.sendMessage(chatId, `${selection.wallet.address} closed listing for token ${tokenId}`);
-        } else {
-          await sdk.api.orders.offchainCancelOrder(item.protocolAddress, item.orderHash, session.data.chain);
-          await sdk.createListing({
-            asset: { tokenId, tokenAddress: session.data.contractAddress },
-            accountAddress: selection.wallet.address,
-            amount: selection.price,
-            expirationTime,
-          });
-          bot.sendMessage(chatId, `${selection.wallet.address} repriced token ${tokenId} to ${selection.price}`);
-        }
-        successCount += 1;
-      } catch (err) {
-        bot.sendMessage(chatId, `Failed on token ${tokenId}: ${err.message}`);
-      }
+    if (session.flow === 'list') {
+      await sdk.createListing(listingParams);
+    } else if (session.mode === 'close') {
+      await sdk.api.orders.offchainCancelOrder(item.protocolAddress, item.orderHash, session.data.chain);
+    } else {
+      await sdk.api.orders.offchainCancelOrder(item.protocolAddress, item.orderHash, session.data.chain);
+      cancelled = true;
+      await sdk.createListing(listingParams);
+    }
+    return { ...base, status: 'ok' };
+  } catch (err) {
+    const error = cancelled ? `old listing cancelled but relist failed: ${err.message}` : err.message;
+    return { ...base, status: 'failed', error };
+  }
+}
 
-      await sleep(DELAY_MS);
+function buildResultSummary(results, startedAt, statsBefore) {
+  const count = (status) => results.filter((r) => r.status === status).length;
+  const statsNow = opensea.getTransportStats();
+  const seconds = Math.round((Date.now() - startedAt) / 1000);
+  const rateLimited = statsNow.rateLimited - statsBefore.rateLimited;
+
+  let text = `Done in ${seconds}s. Success: ${count('ok')}, failed: ${count('failed')}, skipped due to race condition: ${count('skipped')}`;
+  text += `\nOpenSea rate limited: ${rateLimited}x (cap ${statsNow.capRps} req/s)`;
+
+  const failed = results.filter((r) => r.status === 'failed');
+  if (failed.length > 0) {
+    const byError = new Map();
+    for (const r of failed) {
+      if (!byError.has(r.error)) byError.set(r.error, []);
+      byError.get(r.error).push(r.tokenId);
+    }
+    text += '\n\nFailed:';
+    for (const [error, ids] of [...byError].slice(0, 5)) {
+      text += `\n${error}\n  tokens: ${ids.slice(0, 15).join(', ')}${ids.length > 15 ? ` (+${ids.length - 15} more)` : ''}`;
     }
   }
 
-  bot.sendMessage(chatId, `Done. Success: ${successCount}, skipped due to race condition: ${skippedCount}`);
-  endAndReturnToMenu(chatId);
+  const skipped = results.filter((r) => r.status === 'skipped').map((r) => r.tokenId);
+  if (skipped.length > 0) {
+    text += `\n\nSkipped (no longer owned): ${skipped.slice(0, 15).join(', ')}${skipped.length > 15 ? ` (+${skipped.length - 15} more)` : ''}`;
+  }
+
+  return text.slice(0, 3900);
+}
+
+async function executeAction(chatId, session) {
+  session.step = 'executing';
+  const expirationTime = Math.round(Date.now() / 1000 + 60 * 60 * 24 * LISTING_DURATION_DAYS);
+  const startedAt = Date.now();
+  const statsBefore = opensea.getTransportStats();
+
+  const firstJobs = [];
+  const restJobs = [];
+  for (const selection of session.data.selections) {
+    const sdk = opensea.makeSdk(selection.wallet, session.data.chain, OPENSEA_API_KEY);
+    selection.items.forEach((item, index) => {
+      const job = { selection, sdk, item };
+      // A wallet that still needs the one-time approval does its FIRST listing alone. Otherwise
+      // parallel listings would each send their own approval tx from the same wallet (same nonce).
+      const warmUp = session.flow === 'list' && selection.gasNeeded && index === 0;
+      (warmUp ? firstJobs : restJobs).push(job);
+    });
+  }
+
+  const total = firstJobs.length + restJobs.length;
+  const progressMsg = await bot.sendMessage(chatId, `Executing... 0/${total}`);
+  const results = [];
+  let lastEdit = Date.now();
+
+  const worker = async (job) => {
+    results.push(await processItem(chatId, session, job, expirationTime));
+    const now = Date.now();
+    if (progressMsg && now - lastEdit >= 4000) {
+      lastEdit = now;
+      bot.editMessageText(`Executing... ${results.length}/${total}`, { chat_id: chatId, message_id: progressMsg.message_id });
+    }
+  };
+
+  await runPool(firstJobs, worker, CONCURRENCY);
+  await runPool(restJobs, worker, CONCURRENCY);
+
+  endAndReturnToMenu(chatId, buildResultSummary(results, startedAt, statsBefore));
 }
 
 async function handleStep(chatId, session, text) {
@@ -174,12 +248,13 @@ async function handleStep(chatId, session, text) {
       session.data.contractAddress = text.trim();
       session.step = 'awaiting_chain';
       sessionStore.setSession(chatId, session, bot);
-      bot.sendMessage(chatId, 'Chain (ethereum/polygon/base/arc/robinhood, blank = ethereum):');
+      bot.sendMessage(chatId, 'Chain (ethereum/polygon/base/arc/robinhood, d = ethereum):');
       break;
     }
 
     case 'awaiting_chain': {
-      const chainInput = (text || '').trim().toLowerCase() || 'ethereum';
+      const rawChain = (text || '').trim().toLowerCase();
+      const chainInput = rawChain === 'd' ? 'ethereum' : rawChain;
       const chain = opensea.CHAIN_MAP[chainInput];
 
       if (!chain) {
@@ -190,8 +265,7 @@ async function handleStep(chatId, session, text) {
       const rpcUrl = RPC_URLS[chainInput];
 
       if (!rpcUrl) {
-        bot.sendMessage(chatId, `No RPC_URL configured for "${chainInput}" in .env, aborting`);
-        endAndReturnToMenu(chatId);
+        endAndReturnToMenu(chatId, `No RPC_URL configured for "${chainInput}" in .env, aborting`);
         return;
       }
 
@@ -202,8 +276,7 @@ async function handleStep(chatId, session, text) {
       const slug = await opensea.getCollectionSlug(chainInput, session.data.contractAddress, OPENSEA_API_KEY);
 
       if (!slug) {
-        bot.sendMessage(chatId, 'Could not resolve collection from this contract address, aborting');
-        endAndReturnToMenu(chatId);
+        endAndReturnToMenu(chatId, 'Could not resolve collection from this contract address, aborting');
         return;
       }
 
@@ -214,8 +287,7 @@ async function handleStep(chatId, session, text) {
       const floorPrice = await opensea.getFloorPrice(readOnlySdk, slug);
 
       if (!floorPrice || floorPrice <= 0) {
-        bot.sendMessage(chatId, 'Floor price not found, aborting');
-        endAndReturnToMenu(chatId);
+        endAndReturnToMenu(chatId, 'Floor price not found, aborting');
         return;
       }
 
@@ -266,8 +338,7 @@ async function handleStep(chatId, session, text) {
         const picked = session.data.walletsData[idx];
 
         if (!picked || picked.items.length === 0) {
-          bot.sendMessage(chatId, 'Invalid selection or wallet has no NFTs, aborting');
-          endAndReturnToMenu(chatId);
+          endAndReturnToMenu(chatId, 'Invalid selection or wallet has no NFTs, aborting');
           return;
         }
 
@@ -297,7 +368,7 @@ async function handleStep(chatId, session, text) {
       if (session.flow === 'list' || session.mode === 'reprice') {
         session.step = 'awaiting_price';
         sessionStore.setSession(chatId, session, bot);
-        bot.sendMessage(chatId, 'Price per NFT: enter a number, or a % like -40% for discount off floor (blank = floor -10%):');
+        bot.sendMessage(chatId, 'Price per NFT: enter a number, or a % like -40% for discount off floor (d = floor -10%):');
       } else {
         finalizeWalletSelection(chatId, session, currentWallet, count, null);
       }
@@ -308,6 +379,12 @@ async function handleStep(chatId, session, text) {
       const currentWallet = session.data.chosenWallets[session.data.walletCursor];
       const rawPrice = opensea.parsePriceInput(text, session.data.floorPrice);
       const price = opensea.roundPriceForChain(rawPrice, session.data.chain);
+
+      if (!Number.isFinite(price) || price <= 0) {
+        bot.sendMessage(chatId, 'Invalid price (use a number > 0, a % like -40%, or d), try again:');
+        return;
+      }
+
       finalizeWalletSelection(chatId, session, currentWallet, session.data.currentCount, price);
       break;
     }
@@ -320,12 +397,14 @@ async function handleStep(chatId, session, text) {
 bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
   if (!isAuthorized(msg.from.id)) return;
+  if (isBusy(chatId)) return bot.sendMessage(chatId, 'Still executing, please wait until it finishes');
   showMainMenu(chatId);
 });
 
 bot.onText(/\/manage-listing/, (msg) => {
   const chatId = msg.chat.id;
   if (!isAuthorized(msg.from.id)) return;
+  if (isBusy(chatId)) return bot.sendMessage(chatId, 'Still executing, please wait until it finishes');
   sessionStore.setSession(chatId, { flow: 'manage', step: 'awaiting_mode', data: {} }, bot);
   bot.sendMessage(chatId, 'Choose action:', {
     reply_markup: {
@@ -344,25 +423,20 @@ bot.on('callback_query', async (query) => {
     return bot.answerCallbackQuery(query.id, { text: 'Unauthorized' });
   }
 
-  const session = sessionStore.getSession(chatId);
+  // Menu buttons always work, even on an old menu message or after a restart/timeout.
+  if (query.data === 'menu_listing' || query.data === 'menu_manage') {
+    if (isBusy(chatId)) {
+      return bot.answerCallbackQuery(query.id, { text: 'Still executing, please wait' });
+    }
 
-  if (!session) {
-    return bot.answerCallbackQuery(query.id, { text: 'Session expired' });
-  }
-
-  if (query.data === 'menu_listing') {
-    session.flow = 'list';
-    session.step = 'awaiting_contract';
-    sessionStore.setSession(chatId, session, bot);
     await bot.answerCallbackQuery(query.id);
-    return bot.sendMessage(chatId, 'Contract address:');
-  }
 
-  if (query.data === 'menu_manage') {
-    session.flow = 'manage';
-    session.step = 'awaiting_mode';
-    sessionStore.setSession(chatId, session, bot);
-    await bot.answerCallbackQuery(query.id);
+    if (query.data === 'menu_listing') {
+      sessionStore.setSession(chatId, { flow: 'list', step: 'awaiting_contract', data: {} }, bot);
+      return bot.sendMessage(chatId, 'Contract address:');
+    }
+
+    sessionStore.setSession(chatId, { flow: 'manage', step: 'awaiting_mode', data: {} }, bot);
     return bot.sendMessage(chatId, 'Choose action:', {
       reply_markup: {
         inline_keyboard: [[
@@ -373,7 +447,18 @@ bot.on('callback_query', async (query) => {
     });
   }
 
+  const session = sessionStore.getSession(chatId);
+
+  // Stale button (session timed out / bot restarted): recover to the menu instead of a dead end.
+  if (!session) {
+    await bot.answerCallbackQuery(query.id, { text: 'Session expired' });
+    return showMainMenu(chatId);
+  }
+
   if (query.data === 'mode_reprice' || query.data === 'mode_close') {
+    if (session.step !== 'awaiting_mode') {
+      return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
+    }
     session.mode = query.data === 'mode_reprice' ? 'reprice' : 'close';
     session.step = 'awaiting_contract';
     sessionStore.setSession(chatId, session, bot);
@@ -382,11 +467,19 @@ bot.on('callback_query', async (query) => {
   }
 
   if (query.data === 'confirm_yes' || query.data === 'confirm_no') {
+    // guards against double taps and old summary buttons
+    if (session.step !== 'awaiting_confirm') {
+      return bot.answerCallbackQuery(query.id, { text: 'Nothing to confirm' });
+    }
+
+    // claim the state synchronously, BEFORE any await, so a second tap can't slip in
+    const confirmed = query.data === 'confirm_yes';
+    session.step = confirmed ? 'executing' : 'cancelled';
+
     await bot.answerCallbackQuery(query.id);
 
-    if (query.data === 'confirm_no') {
-      bot.sendMessage(chatId, 'Cancelled');
-      return endAndReturnToMenu(chatId);
+    if (!confirmed) {
+      return endAndReturnToMenu(chatId, 'Cancelled');
     }
 
     return executeAction(chatId, session);
@@ -400,21 +493,20 @@ bot.on('message', async (msg) => {
   if (!isAuthorized(msg.from.id)) return;
 
   const session = sessionStore.getSession(chatId);
-  if (!session) return;
+  // nothing to handle while idle on the menu; don't re-arm a timer for it
+  if (!session || session.step === 'main_menu') return;
 
   sessionStore.setSession(chatId, session, bot);
 
   try {
     await handleStep(chatId, session, msg.text);
   } catch (err) {
-    bot.sendMessage(chatId, `Error: ${err.message}`);
-    endAndReturnToMenu(chatId);
+    endAndReturnToMenu(chatId, `Error: ${err.message}`);
   }
 });
 
 sessionStore.configureTimeoutHandler((chatId) => {
-  bot.sendMessage(chatId, 'Session timed out after 3 minutes of inactivity.');
-  showMainMenu(chatId);
+  showMainMenu(chatId, 'Session timed out after 3 minutes of inactivity.');
 });
 
 bot.on('polling_error', (err) => {
@@ -422,4 +514,3 @@ bot.on('polling_error', (err) => {
 });
 
 console.log('Bot running');
-
