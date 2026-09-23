@@ -661,7 +661,7 @@ bot.on('callback_query', async (query) => {
   }
 
   // Menu buttons always work, even on an old menu message or after a restart/timeout.
-  if (query.data === 'menu_listing' || query.data === 'menu_manage') {
+  if (['menu_listing', 'menu_manage', 'menu_fastlist', 'menu_settings'].includes(query.data)) {
     if (isBusy(chatId)) {
       return bot.answerCallbackQuery(query.id, { text: 'Still executing, please wait' });
     }
