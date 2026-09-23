@@ -337,11 +337,28 @@ async function resolveCollectionAndWallets(chatId, session, chainInput) {
   });
   bot.sendMessage(chatId, menuText.trim());
 
-  const menuNumbers = walletsData.map((_, i) => i + 1).join('/');
-  const actionVerb = session.flow === 'list' ? 'list' : session.mode;
+  if (session.flow === 'list') {
+    session.step = 'awaiting_list_mode';
+    sessionStore.setSession(chatId, session, bot);
+    bot.sendMessage(chatId, 'Listing mode:', {
+      reply_markup: {
+        inline_keyboard: [[
+          { text: 'Separate List', callback_data: 'mode_separate' },
+          { text: 'Bulk List', callback_data: 'mode_bulk' },
+        ]],
+      },
+    });
+    return;
+  }
+
+  enterWalletPick(chatId, session);
+}
+
+function enterWalletPick(chatId, session) {
+  const menuNumbers = session.data.walletsData.map((_, i) => i + 1).join('/');
   session.step = 'awaiting_wallet_pick';
   sessionStore.setSession(chatId, session, bot);
-  bot.sendMessage(chatId, `Which one you want to ${actionVerb} (${menuNumbers}/all)?`);
+  bot.sendMessage(chatId, `Which one you want to ${session.mode} (${menuNumbers}/all)?`);
 }
 
 async function handleStep(chatId, session, text) {
@@ -458,6 +475,51 @@ async function handleStep(chatId, session, text) {
       break;
     }
 
+    case 'awaiting_bulk_count': {
+      const maxTotal = session.data.walletsData.reduce((sum, w) => sum + w.items.length, 0);
+      const count = Math.min(parseInt(text, 10) || 0, maxTotal);
+
+      if (count === 0) {
+        endAndReturnToMenu(chatId, 'Nothing selected, aborting');
+        return;
+      }
+
+      session.data.bulkCount = count;
+      session.step = 'awaiting_bulk_price';
+      sessionStore.setSession(chatId, session, bot);
+      bot.sendMessage(chatId, 'Price per NFT: enter a number, or a % like -40% for discount off floor (d = floor -10%):');
+      break;
+    }
+
+    case 'awaiting_bulk_price': {
+      const rawPrice = opensea.parsePriceInput(text, session.data.floorPrice);
+      const price = opensea.roundPriceForChain(rawPrice, session.data.chain);
+
+      if (!Number.isFinite(price) || price <= 0) {
+        bot.sendMessage(chatId, 'Invalid price (use a number > 0, a % like -40%, or d), try again:');
+        return;
+      }
+
+      session.data.selections = [];
+      let remaining = session.data.bulkCount;
+      for (const w of session.data.walletsData) {
+        if (remaining <= 0) break;
+        const take = Math.min(remaining, w.items.length);
+        if (take > 0) {
+          session.data.selections.push({ wallet: w.wallet, items: w.items.slice(0, take), price });
+          remaining -= take;
+        }
+      }
+
+      if (session.data.selections.length === 0) {
+        endAndReturnToMenu(chatId, 'Nothing selected, aborting');
+        return;
+      }
+
+      await goToSummary(chatId, session);
+      break;
+    }
+
     default:
       break;
   }
@@ -541,6 +603,23 @@ bot.on('callback_query', async (query) => {
     }
     await bot.answerCallbackQuery(query.id);
     return resolveCollectionAndWallets(chatId, session, query.data.slice(6));
+  }
+
+  if (query.data === 'mode_separate' || query.data === 'mode_bulk') {
+    if (session.step !== 'awaiting_list_mode') {
+      return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
+    }
+    await bot.answerCallbackQuery(query.id);
+    if (query.data === 'mode_separate') {
+      return enterWalletPick(chatId, session);
+    }
+    const maxTotal = session.data.walletsData.reduce((sum, w) => sum + w.items.length, 0);
+    if (maxTotal === 0) {
+      return endAndReturnToMenu(chatId, 'No wallets hold NFTs from this collection, aborting');
+    }
+    session.step = 'awaiting_bulk_count';
+    sessionStore.setSession(chatId, session, bot);
+    return bot.sendMessage(chatId, `How many NFTs total (max ${maxTotal}, fills wallets in order)?`);
   }
 
   if (query.data === 'confirm_yes' || query.data === 'confirm_no') {
