@@ -60,7 +60,7 @@ Then open your bot in Telegram and send /start.
 
 ## Usage
 
-1. Choose Listing or Manage Listing from the menu.
+1. Paste the collection contract address any time, even from the main menu. The bot asks what to do: Listing or Manage Listing. You can also pick a menu button first and paste the address when asked.
 2. For Manage Listing, choose Reprice or Close.
    Wallet and contract addresses in bot messages are shortened to first and last characters, for example 0x3ff72...f1414.
 3. Send the collection contract address. The bot scans every configured chain on-chain and auto-picks the one where your wallets hold NFTs. A picker appears only if several chains have holdings; if none do, you type the chain manually.

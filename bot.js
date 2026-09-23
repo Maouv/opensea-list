@@ -9,6 +9,8 @@ function shortAddr(address) {
   return `${address.slice(0, 7)}...${address.slice(-5)}`;
 }
 
+const CA_REGEX = /^0x[0-9a-fA-F]{40}$/;
+
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const AUTHORIZED_USER_ID = process.env.TELEGRAM_USER_ID;
 const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY;
@@ -378,6 +380,33 @@ function enterWalletPick(chatId, session) {
   bot.sendMessage(chatId, `Which one you want to ${session.mode} (${menuNumbers}/all)?`);
 }
 
+async function startDetection(chatId, session) {
+  session.step = 'detecting_chain';
+  sessionStore.setSession(chatId, session, bot);
+  bot.sendMessage(chatId, 'Scanning chains...');
+  const counts = await detectChainHoldings(session.data.contractAddress);
+  console.log(`detect ${session.data.contractAddress}:`, JSON.stringify(counts));
+  const withHoldings = counts.filter(([, total]) => total > 0);
+  if (withHoldings.length === 1) {
+    bot.sendMessage(chatId, `Chain detected: ${withHoldings[0][0]} (${withHoldings[0][1]} NFT)`);
+    await resolveCollectionAndWallets(chatId, session, withHoldings[0][0]);
+  } else if (withHoldings.length > 1) {
+    session.step = 'awaiting_chain_pick';
+    sessionStore.setSession(chatId, session, bot);
+    bot.sendMessage(chatId, 'Holdings on multiple chains, pick one:', {
+      reply_markup: {
+        inline_keyboard: [
+          withHoldings.map(([name, total]) => ({ text: `${name} (${total})`, callback_data: `chain_${name}` })),
+        ],
+      },
+    });
+  } else {
+    session.step = 'awaiting_chain';
+    sessionStore.setSession(chatId, session, bot);
+    bot.sendMessage(chatId, 'No holdings found on any configured chain. Chain manually (ethereum/polygon/base/arc/robinhood, d = ethereum):');
+  }
+}
+
 async function handleStep(chatId, session, text) {
   switch (session.step) {
     case 'awaiting_contract': {
@@ -387,30 +416,7 @@ async function handleStep(chatId, session, text) {
         return;
       }
       session.data.contractAddress = address;
-      session.step = 'detecting_chain';
-      sessionStore.setSession(chatId, session, bot);
-      bot.sendMessage(chatId, 'Scanning chains...');
-      const counts = await detectChainHoldings(address);
-      console.log(`detect ${address}:`, JSON.stringify(counts));
-      const withHoldings = counts.filter(([, total]) => total > 0);
-      if (withHoldings.length === 1) {
-        bot.sendMessage(chatId, `Chain detected: ${withHoldings[0][0]} (${withHoldings[0][1]} NFT)`);
-        await resolveCollectionAndWallets(chatId, session, withHoldings[0][0]);
-      } else if (withHoldings.length > 1) {
-        session.step = 'awaiting_chain_pick';
-        sessionStore.setSession(chatId, session, bot);
-        bot.sendMessage(chatId, 'Holdings on multiple chains, pick one:', {
-          reply_markup: {
-            inline_keyboard: [
-              withHoldings.map(([name, total]) => ({ text: `${name} (${total})`, callback_data: `chain_${name}` })),
-            ],
-          },
-        });
-      } else {
-        session.step = 'awaiting_chain';
-        sessionStore.setSession(chatId, session, bot);
-        bot.sendMessage(chatId, 'No holdings found on any configured chain. Chain manually (ethereum/polygon/base/arc/robinhood, d = ethereum):');
-      }
+      await startDetection(chatId, session);
       break;
     }
 
@@ -609,10 +615,35 @@ bot.on('callback_query', async (query) => {
       return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
     }
     session.mode = query.data === 'mode_reprice' ? 'reprice' : 'close';
+    await bot.answerCallbackQuery(query.id);
+    if (session.data.contractAddress) {
+      return startDetection(chatId, session);
+    }
     session.step = 'awaiting_contract';
     sessionStore.setSession(chatId, session, bot);
-    await bot.answerCallbackQuery(query.id);
     return bot.sendMessage(chatId, 'Contract address:');
+  }
+
+  if (query.data === 'start_list' || query.data === 'start_manage') {
+    if (session.step !== 'awaiting_start_mode') {
+      return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
+    }
+    await bot.answerCallbackQuery(query.id);
+    if (query.data === 'start_list') {
+      session.flow = 'list';
+      return startDetection(chatId, session);
+    }
+    session.flow = 'manage';
+    session.step = 'awaiting_mode';
+    sessionStore.setSession(chatId, session, bot);
+    return bot.sendMessage(chatId, 'Choose action:', {
+      reply_markup: {
+        inline_keyboard: [[
+          { text: 'Reprice', callback_data: 'mode_reprice' },
+          { text: 'Close', callback_data: 'mode_close' },
+        ]],
+      },
+    });
   }
 
   if (query.data.startsWith('chain_')) {
@@ -667,6 +698,21 @@ bot.on('message', async (msg) => {
   if (!isAuthorized(msg.from.id)) return;
 
   const session = sessionStore.getSession(chatId);
+  const text = msg.text.trim();
+
+  if (CA_REGEX.test(text) && (!session || session.step === 'main_menu')) {
+    if (isBusy(chatId)) return bot.sendMessage(chatId, 'Still executing, please wait until it finishes');
+    sessionStore.setSession(chatId, { flow: null, step: 'awaiting_start_mode', data: { contractAddress: text } }, bot);
+    return bot.sendMessage(chatId, 'What do you want to do with this collection?', {
+      reply_markup: {
+        inline_keyboard: [[
+          { text: 'Listing', callback_data: 'start_list' },
+          { text: 'Manage Listing', callback_data: 'start_manage' },
+        ]],
+      },
+    });
+  }
+
   // nothing to handle while idle on the menu; don't re-arm a timer for it
   if (!session || session.step === 'main_menu') return;
 
