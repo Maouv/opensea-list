@@ -67,6 +67,7 @@ Then open your bot in Telegram and send /start.
 4. Pick Separate List to configure each wallet (count and price per wallet), or Bulk List to set one total count and one price for every wallet at once. Bulk fills wallets in the order they were listed.
 5. Separate List: pick a wallet by number, or send all, then set count and price per wallet. Bulk List: send the total count, then the price.
    Wallets with items already listed are marked "(N already listed)" and the summary warns before you confirm, since listing again may double-list.
+   Collections you successfully resolve are remembered (last 3). When asked for a contract address you can either paste one or tap a recent collection button. After a successful listing the menu shows "Manage this collection" for that same collection.
 6. Price formats:
    a number, for example 0.05
    a percentage relative to floor, for example -40%

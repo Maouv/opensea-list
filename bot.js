@@ -4,12 +4,23 @@ const { ethers } = require('ethers');
 const opensea = require('./lib/opensea');
 const holdings = require('./lib/holdings');
 const sessionStore = require('./lib/session');
+const fs = require('fs');
+const path = require('path');
 
 function shortAddr(address) {
   return `${address.slice(0, 7)}...${address.slice(-5)}`;
 }
 
 const CA_REGEX = /^0x[0-9a-fA-F]{40}$/;
+
+const CA_MEMORY_FILE = path.join(__dirname, 'ca-memory.json');
+const CA_MEMORY_LIMIT = 3;
+let caMemory = [];
+try { caMemory = JSON.parse(fs.readFileSync(CA_MEMORY_FILE, 'utf8')); } catch {}
+function rememberCa(entry) {
+  caMemory = [entry, ...caMemory.filter((e) => e.address.toLowerCase() !== entry.address.toLowerCase() || e.chain !== entry.chain)].slice(0, CA_MEMORY_LIMIT);
+  fs.writeFileSync(CA_MEMORY_FILE, JSON.stringify(caMemory));
+}
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const AUTHORIZED_USER_ID = process.env.TELEGRAM_USER_ID;
@@ -53,21 +64,25 @@ function isBusy(chatId) {
   return Boolean(s && s.step === 'executing');
 }
 
-function endAndReturnToMenu(chatId, notice) {
+function endAndReturnToMenu(chatId, notice, manageAddress) {
   sessionStore.endSession(chatId);
-  showMainMenu(chatId, notice);
+  showMainMenu(chatId, notice, manageAddress);
 }
 
-function showMainMenu(chatId, notice) {
+function showMainMenu(chatId, notice, manageAddress) {
   // idle: the menu is a resting state, it has no inactivity timer
   sessionStore.setSession(chatId, { flow: null, step: 'main_menu', data: {} }, bot, { idle: true });
   const text = notice ? `${notice}\n\nWhat do you want to do?` : 'What do you want to do?';
+  const rows = [[
+    { text: 'Listing', callback_data: 'menu_listing' },
+    { text: 'Manage Listing', callback_data: 'menu_manage' },
+  ]];
+  if (manageAddress) {
+    rows.push([{ text: 'Manage this collection', callback_data: 'manage_recent' }]);
+  }
   bot.sendMessage(chatId, text, {
     reply_markup: {
-      inline_keyboard: [[
-        { text: 'Listing', callback_data: 'menu_listing' },
-        { text: 'Manage Listing', callback_data: 'menu_manage' },
-      ]],
+      inline_keyboard: rows,
     },
   });
 }
@@ -261,7 +276,7 @@ async function executeAction(chatId, session) {
   await runPool(firstJobs, worker, CONCURRENCY);
   await runPool(restJobs, worker, CONCURRENCY);
 
-  endAndReturnToMenu(chatId, buildResultSummary(results, startedAt, statsBefore));
+  endAndReturnToMenu(chatId, buildResultSummary(results, startedAt, statsBefore), session.flow === 'list' ? session.data.contractAddress : null);
 }
 
 async function detectChainHoldings(address) {
@@ -296,6 +311,7 @@ async function resolveCollectionAndWallets(chatId, session, chainInput) {
   }
 
   session.data.slug = slug;
+  rememberCa({ address: session.data.contractAddress, chain: chainInput, slug });
   bot.sendMessage(chatId, `Collection detected: ${slug}`);
 
   const readOnlySdk = opensea.makeSdk(provider, chain, OPENSEA_API_KEY);
@@ -378,6 +394,13 @@ function enterWalletPick(chatId, session) {
   session.step = 'awaiting_wallet_pick';
   sessionStore.setSession(chatId, session, bot);
   bot.sendMessage(chatId, `Which one you want to ${session.mode} (${menuNumbers}/all)?`);
+}
+
+function promptContract(chatId, session) {
+  session.step = 'awaiting_contract';
+  sessionStore.setSession(chatId, session, bot);
+  const rows = caMemory.map((e, i) => [{ text: `${e.slug} (${e.chain})`, callback_data: `mem_${i}` }]);
+  bot.sendMessage(chatId, rows.length ? 'Contract address, or pick recent:' : 'Contract address:', rows.length ? { reply_markup: { inline_keyboard: rows } } : undefined);
 }
 
 async function startDetection(chatId, session) {
@@ -587,12 +610,33 @@ bot.on('callback_query', async (query) => {
     await bot.answerCallbackQuery(query.id);
 
     if (query.data === 'menu_listing') {
-      sessionStore.setSession(chatId, { flow: 'list', step: 'awaiting_contract', data: {} }, bot);
-      return bot.sendMessage(chatId, 'Contract address:');
+      const session = { flow: 'list', step: 'awaiting_contract', data: {} };
+      sessionStore.setSession(chatId, session, bot);
+      return promptContract(chatId, session);
     }
 
     sessionStore.setSession(chatId, { flow: 'manage', step: 'awaiting_mode', data: {} }, bot);
     return bot.sendMessage(chatId, 'Choose action:', {
+      reply_markup: {
+        inline_keyboard: [[
+          { text: 'Reprice', callback_data: 'mode_reprice' },
+          { text: 'Close', callback_data: 'mode_close' },
+        ]],
+      },
+    });
+  }
+
+  if (query.data === 'manage_recent') {
+    if (isBusy(chatId)) {
+      return bot.answerCallbackQuery(query.id, { text: 'Still executing, please wait' });
+    }
+    const recent = caMemory[0];
+    if (!recent) {
+      return bot.answerCallbackQuery(query.id, { text: 'No recent collection yet' });
+    }
+    await bot.answerCallbackQuery(query.id);
+    sessionStore.setSession(chatId, { flow: 'manage', step: 'awaiting_mode', data: { contractAddress: recent.address } }, bot);
+    return bot.sendMessage(chatId, `Manage ${recent.slug} (${recent.chain}):`, {
       reply_markup: {
         inline_keyboard: [[
           { text: 'Reprice', callback_data: 'mode_reprice' },
@@ -619,9 +663,7 @@ bot.on('callback_query', async (query) => {
     if (session.data.contractAddress) {
       return startDetection(chatId, session);
     }
-    session.step = 'awaiting_contract';
-    sessionStore.setSession(chatId, session, bot);
-    return bot.sendMessage(chatId, 'Contract address:');
+    return promptContract(chatId, session);
   }
 
   if (query.data === 'start_list' || query.data === 'start_manage') {
@@ -644,6 +686,19 @@ bot.on('callback_query', async (query) => {
         ]],
       },
     });
+  }
+
+  if (query.data.startsWith('mem_')) {
+    if (session.step !== 'awaiting_contract') {
+      return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
+    }
+    const entry = caMemory[Number(query.data.slice(4))];
+    if (!entry) {
+      return bot.answerCallbackQuery(query.id, { text: 'Not found' });
+    }
+    await bot.answerCallbackQuery(query.id);
+    session.data.contractAddress = entry.address;
+    return startDetection(chatId, session);
   }
 
   if (query.data.startsWith('chain_')) {
