@@ -395,6 +395,7 @@ async function resolveCollectionAndWallets(chatId, session, chainInput) {
 
     const scoped = walletsData.filter((w) => w.items.length > 0 && fastSettings.wallets[w.wallet.address] !== false);
     session.data.selections = scoped.map((w) => ({ wallet: w.wallet, items: w.items, price }));
+    console.log(`fast list: ${session.data.selections.length} wallet(s), price=${price}`);
 
     if (session.data.selections.length === 0) {
       endAndReturnToMenu(chatId, 'No wallet enabled in Fast List settings, aborting');
@@ -656,12 +657,23 @@ bot.onText(/\/manage-listing/, (msg) => {
 bot.on('callback_query', async (query) => {
   const chatId = query.message.chat.id;
 
+  try {
+    await handleCallback(chatId, query);
+  } catch (err) {
+    console.log(`callback error ${query.data}:`, err.message);
+    try { await bot.answerCallbackQuery(query.id, { text: 'Error' }); } catch {}
+    endAndReturnToMenu(chatId, `Error: ${err.message}`);
+  }
+});
+
+async function handleCallback(chatId, query) {
   if (!isAuthorized(query.from.id)) {
     return bot.answerCallbackQuery(query.id, { text: 'Unauthorized' });
   }
 
   // Menu buttons always work, even on an old menu message or after a restart/timeout.
   if (['menu_listing', 'menu_manage', 'menu_fastlist', 'menu_settings'].includes(query.data)) {
+    console.log(`menu tap: ${query.data}`);
     if (isBusy(chatId)) {
       return bot.answerCallbackQuery(query.id, { text: 'Still executing, please wait' });
     }
@@ -839,7 +851,7 @@ bot.on('callback_query', async (query) => {
 
     return executeAction(chatId, session);
   }
-});
+}
 
 bot.on('message', async (msg) => {
   if (!msg.text || msg.text.startsWith('/')) return;
