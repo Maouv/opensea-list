@@ -23,7 +23,7 @@ function rememberCa(entry) {
 }
 
 const SETTINGS_FILE = path.join(__dirname, 'fastlist-settings.json');
-let fastSettings = { price: '-40%', wallets: {} };
+let fastSettings = { price: '-40%', confirm: true, wallets: {} };
 try {
   const loaded = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
   if (loaded && typeof loaded === 'object') fastSettings = { ...fastSettings, ...loaded };
@@ -159,14 +159,23 @@ async function goToSummary(chatId, session) {
     }
   }
 
-  bot.sendMessage(chatId, summary.trim(), {
+  const skipConfirm = session.flow === 'list' && session.data.fast && fastSettings.confirm === false;
+  const buttons = skipConfirm ? undefined : {
     reply_markup: {
       inline_keyboard: [[
         { text: 'Yes', callback_data: 'confirm_yes' },
         { text: 'No', callback_data: 'confirm_no' },
       ]],
     },
-  });
+  };
+  bot.sendMessage(chatId, skipConfirm ? `${summary.trim()}\n\nListing now (confirmation is OFF in settings)` : summary.trim(), buttons);
+
+  if (skipConfirm) {
+    session.step = 'executing';
+    sessionStore.setSession(chatId, session, bot);
+    await executeAction(chatId, session);
+    return;
+  }
 
   session.step = 'awaiting_confirm';
   sessionStore.setSession(chatId, session, bot);
@@ -433,6 +442,7 @@ function enterWalletPick(chatId, session) {
 function showFastSettings(chatId) {
   sessionStore.setSession(chatId, { flow: null, step: 'awaiting_settings', data: {} }, bot);
   const rows = [[{ text: `Price: ${fastSettings.price}`, callback_data: 'set_price' }]];
+  rows.push([{ text: `Confirmation: ${fastSettings.confirm === false ? 'OFF' : 'ON'}`, callback_data: 'set_confirm' }]);
   PRIVATE_KEYS.forEach((pk, i) => {
     const address = new ethers.Wallet(pk).address;
     const on = fastSettings.wallets[address] !== false;
@@ -654,7 +664,10 @@ bot.onText(/\/manage-listing/, (msg) => {
   });
 });
 
+bot.on('polling_error', (err) => console.log('polling_error:', err.code, err.message));
+
 bot.on('callback_query', async (query) => {
+  console.log(`cb received: ${query.data}`);
   const chatId = query.message.chat.id;
 
   try {
@@ -786,7 +799,7 @@ async function handleCallback(chatId, query) {
     return startDetection(chatId, session);
   }
 
-  if (query.data === 'set_price' || query.data === 'set_done' || query.data.startsWith('setw_')) {
+  if (query.data === 'set_price' || query.data === 'set_confirm' || query.data === 'set_done' || query.data.startsWith('setw_')) {
     if (!session || session.step !== 'awaiting_settings') {
       return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
     }
@@ -801,6 +814,12 @@ async function handleCallback(chatId, query) {
     if (query.data.startsWith('setw_')) {
       const address = new ethers.Wallet(PRIVATE_KEYS[Number(query.data.slice(5))]).address;
       fastSettings.wallets[address] = fastSettings.wallets[address] === false;
+      saveFastSettings();
+      return showFastSettings(chatId);
+    }
+
+    if (query.data === 'set_confirm') {
+      fastSettings.confirm = fastSettings.confirm === false;
       saveFastSettings();
       return showFastSettings(chatId);
     }

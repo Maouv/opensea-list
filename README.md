@@ -70,6 +70,7 @@ One-tap listing. The main menu shows Fast List next to Listing and Manage Listin
 No slash commands — Settings is an inline button on the main menu.
 
 - Price: a fixed number, or a percentage off floor like -40% (default). Applies to every Fast List execution, resolved against the floor at run time.
+- Confirmation: tap to toggle ON or OFF (default ON). ON = Fast List shows the summary with a Yes/No confirm before listing. OFF = Fast List lists immediately after the summary. Normal Listing is always confirmed.
 - Wallets: tap a wallet row to toggle it ON or OFF. Wallets default to ON; OFF wallets are skipped by Fast List only. Stored in fastlist-settings.json.
 
 ## Usage
