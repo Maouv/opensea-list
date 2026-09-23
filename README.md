@@ -80,6 +80,7 @@ No slash commands — Settings is an inline button on the main menu.
    Wallet and contract addresses in bot messages are shortened to first and last characters, for example 0x3ff72...f1414.
 3. Send the collection contract address. The bot scans every configured chain on-chain and auto-picks the one where your wallets hold NFTs. A picker appears only if several chains have holdings; if none do, you type the chain manually.
 4. Pick Separate List to configure each wallet (count and price per wallet), or Bulk List to set one total count and one price for every wallet at once. Bulk fills wallets in the order they were listed.
+   Listing a token that already has an active listing cancels the old listing first (free off-chain cancel), so relisting replaces instead of stacking duplicate orders.
 5. Separate List: pick a wallet by number, or send all, then set count and price per wallet. Bulk List: send the total count, then the price.
    Wallets with items already listed are marked "(N already listed)" and the summary warns before you confirm, since listing again may double-list.
    Collections you successfully resolve are remembered (last 3). When asked for a contract address you can either paste one or tap a recent collection button. After a successful listing the menu shows "Manage this collection" for that same collection.

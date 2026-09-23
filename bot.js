@@ -216,6 +216,12 @@ async function processItem(chatId, session, job, expirationTime) {
     };
 
     if (session.flow === 'list') {
+      for (const old of job.cancelListings || []) {
+        await sdk.api.orders.offchainCancelOrder(old.protocolAddress, old.orderHash, session.data.chain);
+      }
+      if (job.cancelListings?.length > 0) {
+        console.log(`cancelled ${job.cancelListings.length} old listing(s) for token ${tokenId} before relisting`);
+      }
       await sdk.createListing(listingParams);
     } else if (session.mode === 'close') {
       await sdk.api.orders.offchainCancelOrder(item.protocolAddress, item.orderHash, session.data.chain);
@@ -271,8 +277,16 @@ async function executeAction(chatId, session) {
   const restJobs = [];
   for (const selection of session.data.selections) {
     const sdk = opensea.makeSdk(selection.wallet, session.data.chain, OPENSEA_API_KEY);
+    let cancelMap = {};
+    if (session.flow === 'list') {
+      const openListings = await opensea.getOpenListings(sdk, selection.wallet.address, session.data.slug, session.data.contractAddress, session.data.chain);
+      cancelMap = openListings.reduce((map, l) => {
+        (map[String(l.tokenId)] = map[String(l.tokenId)] || []).push({ orderHash: l.orderHash, protocolAddress: l.protocolAddress });
+        return map;
+      }, {});
+    }
     selection.items.forEach((item, index) => {
-      const job = { selection, sdk, item };
+      const job = { selection, sdk, item, cancelListings: cancelMap[String(item)] || [] };
       // A wallet that still needs the one-time approval does its FIRST listing alone. Otherwise
       // parallel listings would each send their own approval tx from the same wallet (same nonce).
       const warmUp = session.flow === 'list' && selection.gasNeeded && index === 0;
