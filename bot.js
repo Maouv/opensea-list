@@ -20,6 +20,13 @@ const RPC_URLS = {
   robinhood: process.env.RPC_URL_ROBINHOOD,
 };
 
+const providers = Object.fromEntries(
+  Object.entries(RPC_URLS)
+    .filter(([, url]) => url)
+    .map(([name, url]) => [name, new ethers.JsonRpcProvider(url)]),
+);
+const walletAddresses = PRIVATE_KEYS.map((pk) => new ethers.Wallet(pk).address);
+
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
 // Telegram calls are mostly fire-and-forget. A network blip (ECONNRESET/ETIMEDOUT) must be
@@ -94,11 +101,14 @@ async function goToSummary(chatId, session) {
   let totalGasEth = 0;
 
   if (session.flow === 'list') {
-    for (const selection of session.data.selections) {
+    await Promise.all(session.data.selections.map(async (selection) => {
       const gasInfo = await opensea.estimateApprovalGas(selection.wallet, session.data.contractAddress, session.data.provider, session.data.chain);
       selection.gasNeeded = gasInfo.needed;
-      totalGasEth += gasInfo.costEth;
-      summary += `${selection.wallet.address}: list ${selection.items.length} NFT(s) at ${selection.price} each${gasInfo.needed ? ` (approval needed, ~${gasInfo.costEth.toFixed(5)} ETH gas)` : ''}\n`;
+      selection.gasCost = gasInfo.costEth;
+    }));
+    for (const selection of session.data.selections) {
+      totalGasEth += selection.gasCost;
+      summary += `${selection.wallet.address}: list ${selection.items.length} NFT(s) at ${selection.price} each${selection.gasNeeded ? ` (approval needed, ~${selection.gasCost.toFixed(5)} ETH gas)` : ''}\n`;
     }
     summary += `Estimated total approval gas: ~${totalGasEth.toFixed(5)} ETH`;
   } else if (session.mode === 'close') {
@@ -243,107 +253,142 @@ async function executeAction(chatId, session) {
   endAndReturnToMenu(chatId, buildResultSummary(results, startedAt, statsBefore));
 }
 
+async function detectChainHoldings(address) {
+  return Promise.all(Object.entries(providers).map(async ([name, provider]) => {
+    const contract = new ethers.Contract(address, ['function balanceOf(address) view returns (uint256)'], provider);
+    const balances = await Promise.all(walletAddresses.map((a) => contract.balanceOf(a).catch(() => 0n)));
+    return [name, balances.reduce((sum, b) => sum + Number(b), 0)];
+  }));
+}
+
+async function resolveCollectionAndWallets(chatId, session, chainInput) {
+  const chain = opensea.CHAIN_MAP[chainInput];
+  const provider = providers[chainInput];
+
+  if (!provider) {
+    endAndReturnToMenu(chatId, `No RPC_URL configured for "${chainInput}" in .env, aborting`);
+    return;
+  }
+
+  session.data.chainInput = chainInput;
+  session.data.chain = chain;
+  session.data.provider = provider;
+
+  const slug = await opensea.getCollectionSlug(chainInput, session.data.contractAddress, OPENSEA_API_KEY);
+
+  if (!slug) {
+    endAndReturnToMenu(chatId, 'Could not resolve collection from this contract address, aborting');
+    return;
+  }
+
+  session.data.slug = slug;
+  bot.sendMessage(chatId, `Collection detected: ${slug}`);
+
+  const readOnlySdk = opensea.makeSdk(provider, chain, OPENSEA_API_KEY);
+  const floorPrice = await opensea.getFloorPrice(readOnlySdk, slug);
+
+  if (!floorPrice || floorPrice <= 0) {
+    endAndReturnToMenu(chatId, 'Floor price not found, aborting');
+    return;
+  }
+
+  session.data.floorPrice = floorPrice;
+  bot.sendMessage(chatId, `Floor price: ${floorPrice}`);
+
+  const walletsData = await Promise.all(PRIVATE_KEYS.map(async (pk) => {
+    const wallet = new ethers.Wallet(pk, provider);
+    const sdk = opensea.makeSdk(wallet, chain, OPENSEA_API_KEY);
+    const notes = [];
+    let items;
+
+    if (session.flow === 'list') {
+      // On-chain is the source of truth. OpenSea's indexer lags (sold NFTs linger, fresh mints
+      // are missing), so it is only used to find candidates that are then verified on-chain.
+      const result = await holdings.getHoldings({
+        provider,
+        contractAddress: session.data.contractAddress,
+        wallet: wallet.address,
+        loadCandidates: (balance) => opensea.getOwnedTokenIds(sdk, wallet.address, session.data.contractAddress, { stopAt: balance }),
+      });
+      items = result.ids;
+      notes.push(...result.warnings);
+      if (result.complete === false) {
+        notes.push(`on-chain balance is ${result.balance} but only ${result.ids.length} found, recent NFTs may be missing`);
+      }
+    } else {
+      const listings = await opensea.getOpenListings(sdk, wallet.address, slug, session.data.contractAddress, chain);
+      const verified = await holdings.filterOwned(provider, session.data.contractAddress, wallet.address, listings, (l) => l.tokenId);
+      items = verified.items;
+      if (verified.removed > 0) {
+        notes.push(`${verified.removed} stale listing(s) hidden, token no longer owned`);
+      }
+    }
+
+    return { wallet, items, notes };
+  }));
+
+  session.data.walletsData = walletsData;
+
+  const verb = session.flow === 'list' ? 'holds' : 'lists';
+  let menuText = '';
+  walletsData.forEach((w, i) => {
+    menuText += `${i + 1}. ${w.wallet.address} ${verb} ${w.items.length} NFT(s) from this collection\n`;
+    w.notes.forEach((note) => { menuText += `   note: ${note}\n`; });
+  });
+  bot.sendMessage(chatId, menuText.trim());
+
+  const menuNumbers = walletsData.map((_, i) => i + 1).join('/');
+  const actionVerb = session.flow === 'list' ? 'list' : session.mode;
+  session.step = 'awaiting_wallet_pick';
+  sessionStore.setSession(chatId, session, bot);
+  bot.sendMessage(chatId, `Which one you want to ${actionVerb} (${menuNumbers}/all)?`);
+}
+
 async function handleStep(chatId, session, text) {
   switch (session.step) {
     case 'awaiting_contract': {
-      session.data.contractAddress = text.trim();
-      session.step = 'awaiting_chain';
+      const address = text.trim();
+      if (!ethers.isAddress(address)) {
+        bot.sendMessage(chatId, 'Not a valid contract address, try again:');
+        return;
+      }
+      session.data.contractAddress = address;
+      session.step = 'detecting_chain';
       sessionStore.setSession(chatId, session, bot);
-      bot.sendMessage(chatId, 'Chain (ethereum/polygon/base/arc/robinhood, d = ethereum):');
+      bot.sendMessage(chatId, 'Scanning chains...');
+      const counts = await detectChainHoldings(address);
+      const withHoldings = counts.filter(([, total]) => total > 0);
+      if (withHoldings.length === 1) {
+        bot.sendMessage(chatId, `Chain detected: ${withHoldings[0][0]} (${withHoldings[0][1]} NFT)`);
+        await resolveCollectionAndWallets(chatId, session, withHoldings[0][0]);
+      } else if (withHoldings.length > 1) {
+        session.step = 'awaiting_chain_pick';
+        sessionStore.setSession(chatId, session, bot);
+        bot.sendMessage(chatId, 'Holdings on multiple chains, pick one:', {
+          reply_markup: {
+            inline_keyboard: [
+              withHoldings.map(([name, total]) => ({ text: `${name} (${total})`, callback_data: `chain_${name}` })),
+            ],
+          },
+        });
+      } else {
+        session.step = 'awaiting_chain';
+        sessionStore.setSession(chatId, session, bot);
+        bot.sendMessage(chatId, 'No holdings found on any configured chain. Chain manually (ethereum/polygon/base/arc/robinhood, d = ethereum):');
+      }
       break;
     }
 
     case 'awaiting_chain': {
       const rawChain = (text || '').trim().toLowerCase();
       const chainInput = rawChain === 'd' ? 'ethereum' : rawChain;
-      const chain = opensea.CHAIN_MAP[chainInput];
 
-      if (!chain) {
+      if (!opensea.CHAIN_MAP[chainInput]) {
         bot.sendMessage(chatId, 'Unsupported chain, try again:');
         return;
       }
 
-      const rpcUrl = RPC_URLS[chainInput];
-
-      if (!rpcUrl) {
-        endAndReturnToMenu(chatId, `No RPC_URL configured for "${chainInput}" in .env, aborting`);
-        return;
-      }
-
-      session.data.chainInput = chainInput;
-      session.data.chain = chain;
-      session.data.provider = new ethers.JsonRpcProvider(rpcUrl);
-
-      const slug = await opensea.getCollectionSlug(chainInput, session.data.contractAddress, OPENSEA_API_KEY);
-
-      if (!slug) {
-        endAndReturnToMenu(chatId, 'Could not resolve collection from this contract address, aborting');
-        return;
-      }
-
-      session.data.slug = slug;
-      bot.sendMessage(chatId, `Collection detected: ${slug}`);
-
-      const readOnlySdk = opensea.makeSdk(session.data.provider, chain, OPENSEA_API_KEY);
-      const floorPrice = await opensea.getFloorPrice(readOnlySdk, slug);
-
-      if (!floorPrice || floorPrice <= 0) {
-        endAndReturnToMenu(chatId, 'Floor price not found, aborting');
-        return;
-      }
-
-      session.data.floorPrice = floorPrice;
-      bot.sendMessage(chatId, `Floor price: ${floorPrice}`);
-
-      const walletsData = [];
-
-      for (const pk of PRIVATE_KEYS) {
-        const wallet = new ethers.Wallet(pk, session.data.provider);
-        const sdk = opensea.makeSdk(wallet, chain, OPENSEA_API_KEY);
-        const notes = [];
-        let items;
-
-        if (session.flow === 'list') {
-          // On-chain is the source of truth. OpenSea's indexer lags (sold NFTs linger, fresh mints
-          // are missing), so it is only used to find candidates that are then verified on-chain.
-          const result = await holdings.getHoldings({
-            provider: session.data.provider,
-            contractAddress: session.data.contractAddress,
-            wallet: wallet.address,
-            loadCandidates: (balance) => opensea.getOwnedTokenIds(sdk, wallet.address, session.data.contractAddress, { stopAt: balance }),
-          });
-          items = result.ids;
-          notes.push(...result.warnings);
-          if (result.complete === false) {
-            notes.push(`on-chain balance is ${result.balance} but only ${result.ids.length} found, recent NFTs may be missing`);
-          }
-        } else {
-          const listings = await opensea.getOpenListings(sdk, wallet.address, slug, session.data.contractAddress, chain);
-          const verified = await holdings.filterOwned(session.data.provider, session.data.contractAddress, wallet.address, listings, (l) => l.tokenId);
-          items = verified.items;
-          if (verified.removed > 0) {
-            notes.push(`${verified.removed} stale listing(s) hidden, token no longer owned`);
-          }
-        }
-
-        walletsData.push({ wallet, items, notes });
-      }
-
-      session.data.walletsData = walletsData;
-
-      const verb = session.flow === 'list' ? 'holds' : 'lists';
-      let menuText = '';
-      walletsData.forEach((w, i) => {
-        menuText += `${i + 1}. ${w.wallet.address} ${verb} ${w.items.length} NFT(s) from this collection\n`;
-        w.notes.forEach((note) => { menuText += `   note: ${note}\n`; });
-      });
-      bot.sendMessage(chatId, menuText.trim());
-
-      const menuNumbers = walletsData.map((_, i) => i + 1).join('/');
-      const actionVerb = session.flow === 'list' ? 'list' : session.mode;
-      session.step = 'awaiting_wallet_pick';
-      sessionStore.setSession(chatId, session, bot);
-      bot.sendMessage(chatId, `Which one you want to ${actionVerb} (${menuNumbers}/all)?`);
+      await resolveCollectionAndWallets(chatId, session, chainInput);
       break;
     }
 
@@ -488,6 +533,14 @@ bot.on('callback_query', async (query) => {
     sessionStore.setSession(chatId, session, bot);
     await bot.answerCallbackQuery(query.id);
     return bot.sendMessage(chatId, 'Contract address:');
+  }
+
+  if (query.data.startsWith('chain_')) {
+    if (session.step !== 'awaiting_chain_pick') {
+      return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
+    }
+    await bot.answerCallbackQuery(query.id);
+    return resolveCollectionAndWallets(chatId, session, query.data.slice(6));
   }
 
   if (query.data === 'confirm_yes' || query.data === 'confirm_no') {

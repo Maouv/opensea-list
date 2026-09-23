@@ -62,15 +62,14 @@ Then open your bot in Telegram and send /start.
 
 1. Choose Listing or Manage Listing from the menu.
 2. For Manage Listing, choose Reprice or Close.
-3. Send the collection contract address.
-4. Send the chain name, or d for ethereum.
-5. Pick a wallet by number, or send all.
-6. Send how many NFTs to process for each wallet. Send 0 to skip a wallet.
-7. For Listing and Reprice, send the price. Accepted formats:
+3. Send the collection contract address. The bot scans every configured chain on-chain and auto-picks the one where your wallets hold NFTs. A picker appears only if several chains have holdings; if none do, you type the chain manually.
+4. Pick a wallet by number, or send all.
+5. Send how many NFTs to process for each wallet. Send 0 to skip a wallet.
+6. For Listing and Reprice, send the price. Accepted formats:
    a number, for example 0.05
    a percentage relative to floor, for example -40%
    d, which means floor price minus 10%
-8. Review the summary and press Yes to execute.
+7. Review the summary and press Yes to execute.
 
 Sessions time out after 3 minutes of inactivity.
 
