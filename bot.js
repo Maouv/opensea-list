@@ -111,6 +111,11 @@ async function goToSummary(chatId, session) {
       summary += `${selection.wallet.address}: list ${selection.items.length} NFT(s) at ${selection.price} each${selection.gasNeeded ? ` (approval needed, ~${selection.gasCost.toFixed(5)} ETH gas)` : ''}\n`;
     }
     summary += `Estimated total approval gas: ~${totalGasEth.toFixed(5)} ETH`;
+    const listedMap = session.data.listedMap || {};
+    const alreadyListed = session.data.selections.reduce((sum, s) => sum + s.items.filter((id) => (listedMap[s.wallet.address] || []).includes(String(id))).length, 0);
+    if (alreadyListed > 0) {
+      summary += `\nWARN: ${alreadyListed} item(s) already have an active listing, listing again may double-list`;
+    }
   } else if (session.mode === 'close') {
     for (const selection of session.data.selections) {
       summary += `${selection.wallet.address}: close ${selection.items.length} listing(s), no gas\n`;
@@ -298,6 +303,7 @@ async function resolveCollectionAndWallets(chatId, session, chainInput) {
   session.data.floorPrice = floorPrice;
   bot.sendMessage(chatId, `Floor price: ${floorPrice}`);
 
+  const listedMap = {};
   const walletsData = await Promise.all(PRIVATE_KEYS.map(async (pk) => {
     const wallet = new ethers.Wallet(pk, provider);
     const sdk = opensea.makeSdk(wallet, chain, OPENSEA_API_KEY);
@@ -318,6 +324,8 @@ async function resolveCollectionAndWallets(chatId, session, chainInput) {
       if (result.complete === false) {
         notes.push(`on-chain balance is ${result.balance} but only ${result.ids.length} found, recent NFTs may be missing`);
       }
+      const activeListings = await opensea.getOpenListings(sdk, wallet.address, slug, session.data.contractAddress, chain);
+      listedMap[wallet.address] = activeListings.map((l) => String(l.tokenId));
     } else {
       const listings = await opensea.getOpenListings(sdk, wallet.address, slug, session.data.contractAddress, chain);
       const verified = await holdings.filterOwned(provider, session.data.contractAddress, wallet.address, listings, (l) => l.tokenId);
@@ -331,11 +339,13 @@ async function resolveCollectionAndWallets(chatId, session, chainInput) {
   }));
 
   session.data.walletsData = walletsData;
+  session.data.listedMap = listedMap;
 
   const verb = session.flow === 'list' ? 'holds' : 'lists';
   let menuText = '';
   walletsData.forEach((w, i) => {
-    menuText += `${i + 1}. ${w.wallet.address} ${verb} ${w.items.length} NFT(s) from this collection\n`;
+    const listedCount = (listedMap[w.wallet.address] || []).length;
+    menuText += `${i + 1}. ${w.wallet.address} ${verb} ${w.items.length} NFT(s) from this collection${listedCount > 0 ? ` (${listedCount} already listed)` : ''}\n`;
     w.notes.forEach((note) => { menuText += `   note: ${note}\n`; });
   });
   bot.sendMessage(chatId, menuText.trim());
