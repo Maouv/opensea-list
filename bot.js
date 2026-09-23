@@ -266,10 +266,12 @@ async function resolveCollectionAndWallets(chatId, session, chainInput) {
   const provider = providers[chainInput];
 
   if (!provider) {
+    console.log(`abort: no RPC for ${chainInput}`);
     endAndReturnToMenu(chatId, `No RPC_URL configured for "${chainInput}" in .env, aborting`);
     return;
   }
 
+  console.log(`resolve chain=${chainInput} flow=${session.flow} mode=${session.mode}`);
   session.data.chainInput = chainInput;
   session.data.chain = chain;
   session.data.provider = provider;
@@ -277,6 +279,7 @@ async function resolveCollectionAndWallets(chatId, session, chainInput) {
   const slug = await opensea.getCollectionSlug(chainInput, session.data.contractAddress, OPENSEA_API_KEY);
 
   if (!slug) {
+    console.log(`abort: no slug for ${session.data.contractAddress} on ${chainInput}`);
     endAndReturnToMenu(chatId, 'Could not resolve collection from this contract address, aborting');
     return;
   }
@@ -374,6 +377,7 @@ async function handleStep(chatId, session, text) {
       sessionStore.setSession(chatId, session, bot);
       bot.sendMessage(chatId, 'Scanning chains...');
       const counts = await detectChainHoldings(address);
+      console.log(`detect ${address}:`, JSON.stringify(counts));
       const withHoldings = counts.filter(([, total]) => total > 0);
       if (withHoldings.length === 1) {
         bot.sendMessage(chatId, `Chain detected: ${withHoldings[0][0]} (${withHoldings[0][1]} NFT)`);
