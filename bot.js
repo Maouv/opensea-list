@@ -5,6 +5,10 @@ const opensea = require('./lib/opensea');
 const holdings = require('./lib/holdings');
 const sessionStore = require('./lib/session');
 
+function shortAddr(address) {
+  return `${address.slice(0, 7)}...${address.slice(-5)}`;
+}
+
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const AUTHORIZED_USER_ID = process.env.TELEGRAM_USER_ID;
 const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY;
@@ -68,7 +72,7 @@ function showMainMenu(chatId, notice) {
 
 function askCountForCurrentWallet(chatId, session) {
   const w = session.data.chosenWallets[session.data.walletCursor];
-  bot.sendMessage(chatId, `How many from ${w.wallet.address} (max ${w.items.length}, 0 to skip)?`);
+  bot.sendMessage(chatId, `How many from ${shortAddr(w.wallet.address)} (max ${w.items.length}, 0 to skip)?`);
 }
 
 function advanceWalletCursor(chatId, session) {
@@ -108,7 +112,7 @@ async function goToSummary(chatId, session) {
     }));
     for (const selection of session.data.selections) {
       totalGasEth += selection.gasCost;
-      summary += `${selection.wallet.address}: list ${selection.items.length} NFT(s) at ${selection.price} each${selection.gasNeeded ? ` (approval needed, ~${selection.gasCost.toFixed(5)} ETH gas)` : ''}\n`;
+      summary += `${shortAddr(selection.wallet.address)}: list ${selection.items.length} NFT(s) at ${selection.price} each${selection.gasNeeded ? ` (approval needed, ~${selection.gasCost.toFixed(5)} ETH gas)` : ''}\n`;
     }
     summary += `Estimated total approval gas: ~${totalGasEth.toFixed(5)} ETH`;
     const listedMap = session.data.listedMap || {};
@@ -118,11 +122,11 @@ async function goToSummary(chatId, session) {
     }
   } else if (session.mode === 'close') {
     for (const selection of session.data.selections) {
-      summary += `${selection.wallet.address}: close ${selection.items.length} listing(s), no gas\n`;
+      summary += `${shortAddr(selection.wallet.address)}: close ${selection.items.length} listing(s), no gas\n`;
     }
   } else {
     for (const selection of session.data.selections) {
-      summary += `${selection.wallet.address}: reprice ${selection.items.length} listing(s) to ${selection.price} each, no gas\n`;
+      summary += `${shortAddr(selection.wallet.address)}: reprice ${selection.items.length} listing(s) to ${selection.price} each, no gas\n`;
     }
   }
 
@@ -345,7 +349,7 @@ async function resolveCollectionAndWallets(chatId, session, chainInput) {
   let menuText = '';
   walletsData.forEach((w, i) => {
     const listedCount = (listedMap[w.wallet.address] || []).length;
-    menuText += `${i + 1}. ${w.wallet.address} ${verb} ${w.items.length} NFT(s) from this collection${listedCount > 0 ? ` (${listedCount} already listed)` : ''}\n`;
+    menuText += `${i + 1}. ${shortAddr(w.wallet.address)} ${verb} ${w.items.length} NFT(s) from this collection${listedCount > 0 ? ` (${listedCount} already listed)` : ''}\n`;
     w.notes.forEach((note) => { menuText += `   note: ${note}\n`; });
   });
   bot.sendMessage(chatId, menuText.trim());

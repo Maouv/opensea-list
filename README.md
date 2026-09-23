@@ -62,6 +62,7 @@ Then open your bot in Telegram and send /start.
 
 1. Choose Listing or Manage Listing from the menu.
 2. For Manage Listing, choose Reprice or Close.
+   Wallet and contract addresses in bot messages are shortened to first and last characters, for example 0x3ff72...f1414.
 3. Send the collection contract address. The bot scans every configured chain on-chain and auto-picks the one where your wallets hold NFTs. A picker appears only if several chains have holdings; if none do, you type the chain manually.
 4. Pick Separate List to configure each wallet (count and price per wallet), or Bulk List to set one total count and one price for every wallet at once. Bulk fills wallets in the order they were listed.
 5. Separate List: pick a wallet by number, or send all, then set count and price per wallet. Bulk List: send the total count, then the price.
