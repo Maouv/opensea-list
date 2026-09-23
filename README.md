@@ -58,6 +58,20 @@ PRIVATE_KEYS is a comma separated list. Only the RPC URLs for chains you actuall
 
 Then open your bot in Telegram and send /start.
 
+## Fast List
+
+One-tap listing. The main menu shows Fast List next to Listing and Manage Listing; pasting a contract address also offers Fast List.
+
+1. Tap Fast List and send (or pick from recent) a contract address.
+2. The bot scans chains, then lists every NFT from every wallet enabled in Settings at the configured price. The normal summary and confirm still apply.
+
+## Settings
+
+No slash commands — Settings is an inline button on the main menu.
+
+- Price: a fixed number, or a percentage off floor like -40% (default). Applies to every Fast List execution, resolved against the floor at run time.
+- Wallets: tap a wallet row to toggle it ON or OFF. Wallets default to ON; OFF wallets are skipped by Fast List only. Stored in fastlist-settings.json.
+
 ## Usage
 
 1. Paste the collection contract address any time, even from the main menu. The bot asks what to do: Listing or Manage Listing. You can also pick a menu button first and paste the address when asked.

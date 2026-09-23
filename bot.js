@@ -22,6 +22,16 @@ function rememberCa(entry) {
   fs.writeFileSync(CA_MEMORY_FILE, JSON.stringify(caMemory));
 }
 
+const SETTINGS_FILE = path.join(__dirname, 'fastlist-settings.json');
+let fastSettings = { price: '-40%', wallets: {} };
+try {
+  const loaded = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
+  if (loaded && typeof loaded === 'object') fastSettings = { ...fastSettings, ...loaded };
+} catch {}
+function saveFastSettings() {
+  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(fastSettings));
+}
+
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const AUTHORIZED_USER_ID = process.env.TELEGRAM_USER_ID;
 const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY;
@@ -74,9 +84,11 @@ function showMainMenu(chatId, notice, manageAddress) {
   sessionStore.setSession(chatId, { flow: null, step: 'main_menu', data: {} }, bot, { idle: true });
   const text = notice ? `${notice}\n\nWhat do you want to do?` : 'What do you want to do?';
   const rows = [[
+    { text: 'Fast List', callback_data: 'menu_fastlist' },
     { text: 'Listing', callback_data: 'menu_listing' },
     { text: 'Manage Listing', callback_data: 'menu_manage' },
   ]];
+  rows.push([{ text: 'Settings', callback_data: 'menu_settings' }]);
   if (manageAddress) {
     rows.push([{ text: 'Manage this collection', callback_data: 'manage_recent' }]);
   }
@@ -372,6 +384,27 @@ async function resolveCollectionAndWallets(chatId, session, chainInput) {
   });
   bot.sendMessage(chatId, menuText.trim());
 
+  if (session.flow === 'list' && session.data.fast) {
+    const rawPrice = opensea.parsePriceInput(fastSettings.price, session.data.floorPrice);
+    const price = opensea.roundPriceForChain(rawPrice, chainInput);
+
+    if (!Number.isFinite(price) || price <= 0) {
+      endAndReturnToMenu(chatId, `Invalid fast list price in settings (${fastSettings.price}), fix it in Settings`);
+      return;
+    }
+
+    const scoped = walletsData.filter((w) => w.items.length > 0 && fastSettings.wallets[w.wallet.address] !== false);
+    session.data.selections = scoped.map((w) => ({ wallet: w.wallet, items: w.items, price }));
+
+    if (session.data.selections.length === 0) {
+      endAndReturnToMenu(chatId, 'No wallet enabled in Fast List settings, aborting');
+      return;
+    }
+
+    await goToSummary(chatId, session);
+    return;
+  }
+
   if (session.flow === 'list') {
     session.step = 'awaiting_list_mode';
     sessionStore.setSession(chatId, session, bot);
@@ -394,6 +427,20 @@ function enterWalletPick(chatId, session) {
   session.step = 'awaiting_wallet_pick';
   sessionStore.setSession(chatId, session, bot);
   bot.sendMessage(chatId, `Which one you want to ${session.mode} (${menuNumbers}/all)?`);
+}
+
+function showFastSettings(chatId) {
+  sessionStore.setSession(chatId, { flow: null, step: 'awaiting_settings', data: {} }, bot);
+  const rows = [[{ text: `Price: ${fastSettings.price}`, callback_data: 'set_price' }]];
+  PRIVATE_KEYS.forEach((pk, i) => {
+    const address = new ethers.Wallet(pk).address;
+    const on = fastSettings.wallets[address] !== false;
+    rows.push([{ text: `${shortAddr(address)}: ${on ? 'ON' : 'OFF'}`, callback_data: `setw_${i}` }]);
+  });
+  rows.push([{ text: 'Done', callback_data: 'set_done' }]);
+  bot.sendMessage(chatId, 'Fast List settings — tap a wallet to toggle, price applies to every enabled wallet:', {
+    reply_markup: { inline_keyboard: rows },
+  });
 }
 
 function promptContract(chatId, session) {
@@ -522,6 +569,18 @@ async function handleStep(chatId, session, text) {
       break;
     }
 
+    case 'awaiting_settings_price': {
+      const raw = opensea.parsePriceInput(text, 1);
+      if (!Number.isFinite(raw)) {
+        bot.sendMessage(chatId, 'Invalid (use a number or % like -40%), try again:');
+        return;
+      }
+      fastSettings.price = text.trim();
+      saveFastSettings();
+      showFastSettings(chatId);
+      break;
+    }
+
     case 'awaiting_bulk_count': {
       const maxTotal = session.data.walletsData.reduce((sum, w) => sum + w.items.length, 0);
       const count = Math.min(parseInt(text, 10) || 0, maxTotal);
@@ -615,6 +674,15 @@ bot.on('callback_query', async (query) => {
       return promptContract(chatId, session);
     }
 
+    if (query.data === 'menu_fastlist') {
+      sessionStore.setSession(chatId, { flow: 'list', step: 'awaiting_contract', data: { fast: true } }, bot);
+      return promptContract(chatId, { flow: 'list', step: 'awaiting_contract', data: { fast: true } });
+    }
+
+    if (query.data === 'menu_settings') {
+      return showFastSettings(chatId);
+    }
+
     sessionStore.setSession(chatId, { flow: 'manage', step: 'awaiting_mode', data: {} }, bot);
     return bot.sendMessage(chatId, 'Choose action:', {
       reply_markup: {
@@ -675,6 +743,11 @@ bot.on('callback_query', async (query) => {
       session.flow = 'list';
       return startDetection(chatId, session);
     }
+    if (query.data === 'start_fastlist') {
+      session.flow = 'list';
+      session.data.fast = true;
+      return startDetection(chatId, session);
+    }
     session.flow = 'manage';
     session.step = 'awaiting_mode';
     sessionStore.setSession(chatId, session, bot);
@@ -699,6 +772,28 @@ bot.on('callback_query', async (query) => {
     await bot.answerCallbackQuery(query.id);
     session.data.contractAddress = entry.address;
     return startDetection(chatId, session);
+  }
+
+  if (query.data === 'set_price' || query.data === 'set_done' || query.data.startsWith('setw_')) {
+    if (!session || session.step !== 'awaiting_settings') {
+      return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
+    }
+    await bot.answerCallbackQuery(query.id);
+
+    if (query.data === 'set_price') {
+      session.step = 'awaiting_settings_price';
+      sessionStore.setSession(chatId, session, bot);
+      return bot.sendMessage(chatId, 'New price: a number, or % off floor like -40%:');
+    }
+
+    if (query.data.startsWith('setw_')) {
+      const address = new ethers.Wallet(PRIVATE_KEYS[Number(query.data.slice(5))]).address;
+      fastSettings.wallets[address] = fastSettings.wallets[address] === false;
+      saveFastSettings();
+      return showFastSettings(chatId);
+    }
+
+    return showMainMenu(chatId, 'Fast List settings saved');
   }
 
   if (query.data.startsWith('chain_')) {
@@ -761,6 +856,7 @@ bot.on('message', async (msg) => {
     return bot.sendMessage(chatId, 'What do you want to do with this collection?', {
       reply_markup: {
         inline_keyboard: [[
+          { text: 'Fast List', callback_data: 'start_fastlist' },
           { text: 'Listing', callback_data: 'start_list' },
           { text: 'Manage Listing', callback_data: 'start_manage' },
         ]],
