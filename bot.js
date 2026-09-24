@@ -5,6 +5,7 @@ const opensea = require('./lib/opensea');
 const holdings = require('./lib/holdings');
 const sessionStore = require('./lib/session');
 const mint = require('./lib/mint');
+const schedules = require('./lib/schedules');
 const fs = require('fs');
 const path = require('path');
 
@@ -556,6 +557,7 @@ async function resolveMint(chatId, session, chainInput) {
   const drop = await (async () => {
     try {
       const slug = await opensea.getCollectionSlug(chainInput, session.data.contractAddress, OPENSEA_API_KEY);
+      session.data.slug = slug;
       return slug ? await mint.fetchDrop(slug) : null;
     } catch {
       return null;
@@ -563,9 +565,20 @@ async function resolveMint(chatId, session, chainInput) {
   })();
 
   if (drop && drop.stages.length > 0) {
+    session.data.drop = drop;
     const active = mint.activeStage(drop);
     if (!active) {
-      return endAndReturnToMenu(chatId, `${session.data.collection} — drop stages:\n${mint.describeStages(drop)}\n\nNo stage open right now, come back when one starts.`);
+      const upcomingPublic = drop.stages.some((s) => s.type === 'PUBLIC_SALE' && s.start > Date.now());
+      session.step = 'mint_stages';
+      sessionStore.setSession(chatId, session, bot);
+      const keyboard = upcomingPublic
+        ? [[{ text: 'Set schedule mint', callback_data: 'menu_sch' }, { text: 'Menu', callback_data: 'menu_home' }]]
+        : [[{ text: 'Menu', callback_data: 'menu_home' }]];
+      return bot.sendMessage(
+        chatId,
+        `${session.data.collection} — drop stages:\n${mint.describeStages(drop)}\n\nNo stage open right now, come back when one starts.`,
+        { reply_markup: { inline_keyboard: keyboard } },
+      );
     }
     session.data.dropStage = active;
     if (active.priceEth != null) {
@@ -598,10 +611,28 @@ function askMintQty(chatId, session) {
 
 async function askMintWallets(chatId, session) {
   const balances = await Promise.all(walletAddresses.map((a) => session.data.provider.getBalance(a)));
-  const lines = walletAddresses.map((a, i) => `${i + 1}. ${shortAddr(a)} — ${Number(ethers.formatEther(balances[i])).toFixed(4)}`).join('\n');
+  let eligible = null;
+  if (session.data.dropStage) {
+    const results = await mint.checkEligibility(
+      session.data.provider,
+      session.data.contractAddress,
+      walletAddresses,
+      session.data.mintSig,
+      session.data.priceWei,
+    );
+    eligible = results;
+  }
+  const lines = walletAddresses.map((a, i) => {
+    const bal = Number(ethers.formatEther(balances[i])).toFixed(4);
+    const mark = eligible ? (eligible[i].ok ? ' eligible' : ` NOT eligible (${eligible[i].reason.slice(0, 60)})`) : '';
+    return `${i + 1}. ${shortAddr(a)} — ${bal} native${mark}`;
+  }).join('\n');
   session.step = 'awaiting_mint_wallets';
   sessionStore.setSession(chatId, session, bot);
-  bot.sendMessage(chatId, `Wallet balance (native):\n${lines}\n\nWhich wallets mint? (e.g. 1,3 or all)`);
+  const head = eligible
+    ? `Stage: ${session.data.dropStage.label} — eligibility (simulated on-chain):\n`
+    : 'Wallet balance (native):\n';
+  bot.sendMessage(chatId, `${head}${lines}\n\nWhich wallets mint? (e.g. 1,3 or all)`);
 }
 
 function parseMintWallets(text) {
@@ -616,6 +647,7 @@ function parseMintWallets(text) {
 async function goToMintSummary(chatId, session, indexes) {
   if (indexes.length === 0) return endAndReturnToMenu(chatId, 'Nothing selected, aborting');
   session.data.selections = indexes.map((i) => ({
+    index: i,
     wallet: new ethers.Wallet(PRIVATE_KEYS[i], session.data.provider),
     qty: session.data.mintQty,
   }));
@@ -637,34 +669,31 @@ async function goToMintSummary(chatId, session, indexes) {
   });
 }
 
-async function executeMint(chatId, session) {
-  session.step = 'executing';
-  sessionStore.setSession(chatId, session, bot);
-  const provider = session.data.provider;
-  const iface = new ethers.Interface([`function ${session.data.mintSig} payable`]);
-  const value = session.data.priceWei * BigInt(session.data.mintQty);
+async function runMint(provider, chainInput, ca, collection, mintSig, mintName, priceWei, qty, indexes, stageLabel, chatId) {
+  const iface = new ethers.Interface([`function ${mintSig} payable`]);
+  const value = priceWei * BigInt(qty);
+  const wallets = indexes.map((i) => new ethers.Wallet(PRIVATE_KEYS[i], provider));
 
   const [network, feeData, blockAtStart] = await Promise.all([provider.getNetwork(), provider.getFeeData(), provider.getBlockNumber()]);
-  const probeWallet = session.data.selections[0].wallet;
-  const probeContract = new ethers.Contract(session.data.contractAddress, iface, provider).connect(probeWallet);
-  const gasLimit = await probeContract[session.data.mintName]
-    .estimateGas(...mint.mintArgs(session.data.mintSig, probeWallet.address, session.data.mintQty), { value })
+  const probeWallet = wallets[0];
+  const probeContract = new ethers.Contract(ca, iface, provider).connect(probeWallet);
+  const gasLimit = await probeContract[mintName]
+    .estimateGas(...mint.mintArgs(mintSig, probeWallet.address, qty), { value })
     .then((g) => (g * 120n) / 100n)
     .catch(() => 600000n);
 
-  bot.sendMessage(chatId, `Minting ${session.data.collection}: ${session.data.selections.length} wallet(s), block ${blockAtStart}...`);
-  const results = await Promise.all(session.data.selections.map(async (sel) => {
-    const base = { wallet: sel.wallet.address };
+  const results = await Promise.all(wallets.map(async (wallet) => {
+    const base = { wallet: wallet.address };
     try {
       const [balance, nonce] = await Promise.all([
-        provider.getBalance(sel.wallet.address),
-        provider.getTransactionCount(sel.wallet.address, 'pending'),
+        provider.getBalance(wallet.address),
+        provider.getTransactionCount(wallet.address, 'pending'),
       ]);
       const maxGasCost = gasLimit * (feeData.maxFeePerGas ?? feeData.gasPrice);
       if (balance < value + maxGasCost) return { ...base, status: 'skipped', error: 'insufficient balance' };
       const tx = {
-        to: session.data.contractAddress,
-        data: iface.encodeFunctionData(session.data.mintName, mint.mintArgs(session.data.mintSig, sel.wallet.address, session.data.mintQty)),
+        to: ca,
+        data: iface.encodeFunctionData(mintName, mint.mintArgs(mintSig, wallet.address, qty)),
         value,
         nonce,
         chainId: network.chainId,
@@ -678,7 +707,7 @@ async function executeMint(chatId, session) {
         tx.gasPrice = feeData.gasPrice;
       }
       const t0 = Date.now();
-      const signed = await sel.wallet.signTransaction(tx);
+      const signed = await wallet.signTransaction(tx);
       const sent = await provider.broadcastTransaction(signed);
       const msBroadcast = Date.now() - t0;
       const receipt = await Promise.race([sent.wait(), new Promise((resolve) => setTimeout(() => resolve(null), 60000))]);
@@ -692,7 +721,7 @@ async function executeMint(chatId, session) {
   }));
 
   const count = (status) => results.filter((r) => r.status === status).length;
-  let text = `Mint done — ${session.data.collection}\nBlock start: ${blockAtStart}. Success: ${count('ok')}, failed: ${count('failed')}, skipped: ${count('skipped')}, pending: ${count('pending')}`;
+  let text = `Mint done — ${collection}\nBlock start: ${blockAtStart}. Success: ${count('ok')}, failed: ${count('failed')}, skipped: ${count('skipped')}, pending: ${count('pending')}`;
   for (const r of results) {
     const timing = r.msBroadcast != null ? ` [${r.msBroadcast}ms broadcast${r.msConfirm != null ? `, ${r.msConfirm}ms confirmed${r.block ? `, block ${r.block}` : ''}]` : ']'}` : '';
     text += r.hash ? `\n${shortAddr(r.wallet)}: ${r.status} ${r.hash}${timing}` : `\n${shortAddr(r.wallet)}: ${r.error}`;
@@ -702,12 +731,12 @@ async function executeMint(chatId, session) {
   try { history = JSON.parse(fs.readFileSync(historyPath, 'utf8')); } catch {}
   history.push({
     ts: new Date().toISOString(),
-    chain: session.data.chainInput,
-    ca: session.data.contractAddress,
-    collection: session.data.collection,
-    stage: session.data.dropStage ? session.data.dropStage.label : null,
-    price: ethers.formatEther(session.data.priceWei),
-    qtyPerWallet: session.data.mintQty,
+    chain: chainInput,
+    ca,
+    collection,
+    stage: stageLabel || null,
+    price: ethers.formatEther(priceWei),
+    qtyPerWallet: qty,
     blockAtStart,
     wallets: results.map((r) => ({
       addr: r.wallet,
@@ -720,8 +749,200 @@ async function executeMint(chatId, session) {
     })),
   });
   fs.writeFileSync(historyPath, JSON.stringify(history, null, 2));
-  endAndReturnToMenu(chatId, text.slice(0, 3900));
+  return { results, blockAtStart, text };
 }
+
+async function executeMint(chatId, session) {
+  session.step = 'executing';
+  sessionStore.setSession(chatId, session, bot);
+  const indexes = session.data.selections.map((s) => s.index);
+  bot.sendMessage(chatId, `Minting ${session.data.collection}: ${indexes.length} wallet(s)...`);
+  const out = await runMint(
+    session.data.provider,
+    session.data.chainInput,
+    session.data.contractAddress,
+    session.data.collection,
+    session.data.mintSig,
+    session.data.mintName,
+    session.data.priceWei,
+    session.data.mintQty,
+    indexes,
+    session.data.dropStage ? session.data.dropStage.label : null,
+    chatId,
+  );
+  endAndReturnToMenu(chatId, out.text.slice(0, 3900));
+}
+
+// ---- Schedule auto-mint ----
+
+const SCH_PAGE = 5;
+
+function schUpcomingStages(drop) {
+  const now = Date.now();
+  return drop.stages
+    .filter((s) => s.type === 'PUBLIC_SALE' && s.start > now)
+    .sort((a, b) => a.start - b.start);
+}
+
+async function enterScheduleMenu(chatId, session) {
+  const drop = session.data.drop;
+  const upcoming = schUpcomingStages(drop);
+  if (upcoming.length === 0) {
+    return endAndReturnToMenu(chatId, 'No upcoming PUBLIC stage to schedule (WL/signed stages need an OpenSea signature, not supported).');
+  }
+  if (upcoming.length > 1) {
+    session.step = 'sch_stage_pick';
+    sessionStore.setSession(chatId, session, bot);
+    return bot.sendMessage(chatId, 'Which stage?', {
+      reply_markup: {
+        inline_keyboard: [
+          ...upcoming.map((s) => [{ text: `${s.label} — ${mint.fmtRangeWIB(s.start, s.end)} WIB`, callback_data: `stage_${s.index}` }]),
+          [{ text: 'Menu', callback_data: 'menu_home' }],
+        ],
+      },
+    });
+  }
+  return enterSchWalletMenu(chatId, session, upcoming[0]);
+}
+
+async function enterSchWalletMenu(chatId, session, stage) {
+  session.data.schStage = stage;
+  session.data.schSel = [];
+  const balances = await Promise.all(walletAddresses.map((a) => session.data.provider.getBalance(a)));
+  const ready = balances.filter((b) => b > 0n).length;
+  session.step = 'sch_menu';
+  sessionStore.setSession(chatId, session, bot);
+  bot.sendMessage(
+    chatId,
+    `Stage: ${stage.label}\n${mint.fmtRangeWIB(stage.start, stage.end)} WIB, ${stage.priceEth} ETH, max ${stage.maxPerWallet ?? '?'}/wallet\n${ready}/${walletAddresses.length} wallet ready (balance > 0). WL eligibility is re-checked automatically at execution.`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: 'Bulk-mint', callback_data: 'sch_bulk' },
+            { text: 'Separate-mint', callback_data: 'sch_sep' },
+          ],
+          [
+            { text: 'See all wallet', callback_data: 'sch_seeall' },
+            { text: 'Menu', callback_data: 'menu_home' },
+          ],
+        ],
+      },
+    },
+  );
+}
+
+function renderSchSepPage(chatId, session) {
+  const sel = session.data.schSel;
+  const page = session.data.schPage;
+  const start = page * SCH_PAGE;
+  const slice = walletAddresses.slice(start, start + SCH_PAGE);
+  const lines = slice.map((a, i) => {
+    const idx = start + i;
+    return `${idx + 1}. ${shortAddr(a)}${sel.includes(idx) ? ' [x]' : ''}`;
+  });
+  const more = walletAddresses.length - start - slice.length;
+  if (more > 0) lines.push(`+${more} more...`);
+  const pages = Math.ceil(walletAddresses.length / SCH_PAGE);
+  const stage = session.data.schStage;
+  session.step = 'schedule_sep';
+  sessionStore.setSession(chatId, session, bot);
+  const nav = pages > 1
+    ? [[
+        ...(page > 0 ? [{ text: '<-', callback_data: 'schp_prev' }] : []),
+        { text: `${page + 1}/${pages}`, callback_data: 'schp_noop' },
+        ...(page < pages - 1 ? [{ text: '->', callback_data: 'schp_next' }] : []),
+      ]]
+    : [];
+  bot.sendMessage(
+    chatId,
+    `Which wallet? (tap number keys below, or type numbers like 1, 7, 8)\n${lines.join('\n')}\n\nSelected: ${sel.length > 0 ? sel.map((i) => i + 1).join(',') : 'none'}`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          ...nav,
+          [{ text: `Done (${sel.length} selected)`, callback_data: 'schp_done' }],
+          [{ text: 'Menu', callback_data: 'menu_home' }],
+        ],
+      },
+    },
+  );
+}
+
+function renderSchSeeAll(chatId, session) {
+  const page = session.data.schPage;
+  const start = page * 8;
+  const slice = walletAddresses.slice(start, start + 8);
+  const lines = slice.map((a, i) => `${start + i + 1}. ${a}`).join('\n');
+  const pages = Math.ceil(walletAddresses.length / 8);
+  session.step = 'schedule_seeall';
+  sessionStore.setSession(chatId, session, bot);
+  bot.sendMessage(chatId, `All wallets (${page + 1}/${pages}):\n${lines}`, {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          ...(page > 0 ? [{ text: '<-', callback_data: 'see_prev' }] : []),
+          ...(page < pages - 1 ? [{ text: '->', callback_data: 'see_next' }] : []),
+        ],
+        [{ text: 'Back', callback_data: 'sch_back' }],
+      ],
+    },
+  });
+}
+
+async function askSchQty(chatId, session) {
+  const max = session.data.schStage.maxPerWallet ?? 100;
+  if (max <= 1) {
+    session.data.schQty = 1;
+    return schConfirm(chatId, session);
+  }
+  session.step = 'schedule_qty';
+  sessionStore.setSession(chatId, session, bot);
+  bot.sendMessage(chatId, `How many per wallet? (1-${max})`);
+}
+
+function schConfirm(chatId, session) {
+  const sel = session.data.schSel;
+  const stage = session.data.schStage;
+  const qty = session.data.schQty;
+  const priceWei = ethers.parseEther(String(stage.priceEth ?? 0));
+  const total = priceWei * BigInt(qty) * BigInt(sel.length);
+  session.step = 'schedule_confirm';
+  sessionStore.setSession(chatId, session, bot);
+  bot.sendMessage(
+    chatId,
+    `--- Schedule Mint ---\n${session.data.collection} — ${stage.label}\n${mint.fmtRangeWIB(stage.start, stage.end)} WIB\nPrice: ${stage.priceEth} ETH × ${qty}/wallet\nWallets (${sel.length}): ${sel.map((i) => shortAddr(walletAddresses[i])).join(', ')}\nTotal: ${ethers.formatEther(total)} ETH + gas\n\nBot fires automatically when the stage opens.`,
+    {
+      reply_markup: {
+        inline_keyboard: [[
+          { text: 'Yes schedule', callback_data: 'sch_confirm_yes' },
+          { text: 'Menu', callback_data: 'menu_home' },
+        ]],
+      },
+    },
+  );
+}
+
+async function fireSchedule(s) {
+  schedules.mark(s.id, 'fired');
+  const provider = providers[s.chain];
+  if (!provider) return bot.sendMessage(s.chatId, `Auto-mint ${s.collection}: no RPC for ${s.chain}, aborting`);
+  let priceWei = ethers.parseEther(String(s.priceEth));
+  try {
+    const drop = await mint.fetchDrop(s.slug);
+    const st = drop && drop.stages.find((x) => x.index === s.stageIndex);
+    if (st && Date.now() >= st.start && Date.now() <= st.end && st.priceEth != null) priceWei = ethers.parseEther(String(st.priceEth));
+  } catch {}
+  bot.sendMessage(s.chatId, `Auto-mint ${s.collection} — "${s.label}" is open! Firing ${s.wallets.length} wallet(s) × ${s.qty}...`);
+  try {
+    const out = await runMint(provider, s.chain, s.ca, s.collection, s.mintSig, s.mintName, priceWei, s.qty, s.wallets, s.label, s.chatId);
+    bot.sendMessage(s.chatId, out.text.slice(0, 3900));
+  } catch (err) {
+    bot.sendMessage(s.chatId, `Auto-mint failed: ${err.message.slice(0, 200)}`);
+  }
+}
+
+schedules.init(fireSchedule);
 
 async function handleStep(chatId, session, text) {
   switch (session.step) {
@@ -782,6 +1003,47 @@ async function handleStep(chatId, session, text) {
 
     case 'awaiting_mint_wallets': {
       await goToMintSummary(chatId, session, parseMintWallets(text));
+      break;
+    }
+
+    case 'schedule_bulk_count': {
+      const n = parseInt(text, 10);
+      const total = walletAddresses.length;
+      if (!Number.isInteger(n) || n < 1 || n > total) {
+        bot.sendMessage(chatId, `Enter a count between 1 and ${total}:`);
+        return;
+      }
+      session.data.schSel = walletAddresses.map((_, i) => i).slice(0, n);
+      await askSchQty(chatId, session);
+      break;
+    }
+
+    case 'schedule_qty': {
+      const max = session.data.schStage.maxPerWallet ?? 100;
+      const qty = parseInt(text, 10);
+      if (!Number.isInteger(qty) || qty < 1 || qty > max) {
+        bot.sendMessage(chatId, `Enter a count between 1 and ${max}:`);
+        return;
+      }
+      session.data.schQty = qty;
+      schConfirm(chatId, session);
+      break;
+    }
+
+    case 'schedule_sep': {
+      const nums = text.split(',').map((p) => parseInt(p.trim(), 10) - 1);
+      const valid = nums.filter((i) => Number.isInteger(i) && i >= 0 && i < walletAddresses.length);
+      if (valid.length === 0) {
+        bot.sendMessage(chatId, 'No valid wallet numbers, try again (e.g. 1, 7, 8):');
+        return;
+      }
+      const sel = new Set(session.data.schSel);
+      for (const i of valid) {
+        if (sel.has(i)) sel.delete(i);
+        else sel.add(i);
+      }
+      session.data.schSel = [...sel].sort((a, b) => a - b);
+      renderSchSepPage(chatId, session);
       break;
     }
 
@@ -1116,6 +1378,147 @@ async function handleCallback(chatId, query) {
     return resolveForFlow(chatId, session, query.data.slice(6));
   }
 
+  if (query.data === 'menu_home') {
+    await bot.answerCallbackQuery(query.id);
+    sessionStore.setSession(chatId, { flow: null, step: 'main_menu', data: {} }, bot);
+    return showMainMenu(chatId);
+  }
+
+  if (query.data === 'menu_sch') {
+    if (session.step !== 'mint_stages') {
+      return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
+    }
+    await bot.answerCallbackQuery(query.id);
+    return enterScheduleMenu(chatId, session);
+  }
+
+  if (query.data.startsWith('stage_')) {
+    if (session.step !== 'sch_stage_pick') {
+      return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
+    }
+    await bot.answerCallbackQuery(query.id);
+    const idx = Number(query.data.slice(6));
+    const stage = session.data.drop.stages.find((s) => s.index === idx);
+    if (!stage) return endAndReturnToMenu(chatId, 'Stage not found, aborting');
+    return enterSchWalletMenu(chatId, session, stage);
+  }
+
+  if (query.data === 'sch_bulk') {
+    if (session.step !== 'sch_menu') {
+      return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
+    }
+    await bot.answerCallbackQuery(query.id);
+    session.step = 'schedule_bulk_count';
+    sessionStore.setSession(chatId, session, bot);
+    return bot.sendMessage(chatId, `How many wallets to mint? (1-${walletAddresses.length}, fills wallets in order)`);
+  }
+
+  if (query.data === 'sch_sep') {
+    if (session.step !== 'sch_menu') {
+      return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
+    }
+    await bot.answerCallbackQuery(query.id);
+    session.data.schSel = [];
+    session.data.schPage = 0;
+    return renderSchSepPage(chatId, session);
+  }
+
+  if (query.data === 'schp_next' || query.data === 'schp_prev') {
+    if (session.step !== 'schedule_sep') {
+      return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
+    }
+    await bot.answerCallbackQuery(query.id);
+    session.data.schPage += query.data === 'schp_next' ? 1 : -1;
+    return renderSchSepPage(chatId, session);
+  }
+
+  if (query.data === 'schp_noop') {
+    return bot.answerCallbackQuery(query.id);
+  }
+
+  if (query.data === 'schp_done') {
+    if (session.step !== 'schedule_sep') {
+      return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
+    }
+    await bot.answerCallbackQuery(query.id);
+    if (session.data.schSel.length === 0) {
+      return bot.answerCallbackQuery(query.id, { text: 'Select at least one wallet first' });
+    }
+    return askSchQty(chatId, session);
+  }
+
+  if (query.data === 'sch_seeall') {
+    if (session.step !== 'sch_menu') {
+      return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
+    }
+    await bot.answerCallbackQuery(query.id);
+    session.data.schPage = 0;
+    return renderSchSeeAll(chatId, session);
+  }
+
+  if (query.data === 'see_next' || query.data === 'see_prev') {
+    if (session.step !== 'schedule_seeall') {
+      return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
+    }
+    await bot.answerCallbackQuery(query.id);
+    session.data.schPage += query.data === 'see_next' ? 1 : -1;
+    return renderSchSeeAll(chatId, session);
+  }
+
+  if (query.data === 'sch_back') {
+    if (session.step !== 'schedule_seeall') {
+      return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
+    }
+    await bot.answerCallbackQuery(query.id);
+    session.step = 'sch_menu';
+    sessionStore.setSession(chatId, session, bot);
+    return bot.sendMessage(chatId, `Stage: ${session.data.schStage.label} — pick a mode:`, {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: 'Bulk-mint', callback_data: 'sch_bulk' },
+            { text: 'Separate-mint', callback_data: 'sch_sep' },
+          ],
+          [
+            { text: 'See all wallet', callback_data: 'sch_seeall' },
+            { text: 'Menu', callback_data: 'menu_home' },
+          ],
+        ],
+      },
+    });
+  }
+
+  if (query.data === 'sch_confirm_yes') {
+    if (session.step !== 'schedule_confirm') {
+      return bot.answerCallbackQuery(query.id, { text: 'Nothing to confirm' });
+    }
+    await bot.answerCallbackQuery(query.id);
+    const stage = session.data.schStage;
+    const schedule = {
+      id: Date.now().toString(36),
+      chatId,
+      chain: session.data.chainInput,
+      ca: session.data.contractAddress,
+      slug: session.data.slug,
+      collection: session.data.collection,
+      stageIndex: stage.index,
+      label: stage.label,
+      type: stage.type,
+      startMs: stage.start,
+      endMs: stage.end,
+      priceEth: stage.priceEth ?? 0,
+      qty: session.data.schQty,
+      wallets: session.data.schSel,
+      mintSig: session.data.mintSig,
+      mintName: session.data.mintName,
+      status: 'pending',
+    };
+    schedules.add(schedule);
+    session.step = 'scheduled';
+    sessionStore.setSession(chatId, session, bot);
+    return endAndReturnToMenu(chatId, `Scheduled ✓ #${schedule.id}\n${schedule.collection} — ${schedule.label}\n${mint.fmtRangeWIB(schedule.startMs, schedule.endMs)} WIB\n${schedule.wallets.length} wallet × ${schedule.qty}, ${schedule.priceEth} ETH each.\nBot fires automatically.`);
+  }
+
   if (query.data === 'mode_separate' || query.data === 'mode_bulk') {
     if (session.step !== 'awaiting_list_mode') {
       return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
@@ -1197,5 +1600,8 @@ sessionStore.configureTimeoutHandler((chatId) => {
 bot.on('polling_error', (err) => {
   console.log('Polling error:', err.message);
 });
+
+const armed = schedules.armAll();
+if (armed > 0) console.log(`armed ${armed} mint schedule(s)`);
 
 console.log('Bot running');
