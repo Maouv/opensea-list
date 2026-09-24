@@ -98,7 +98,8 @@ function showMainMenu(chatId, notice, manageAddress) {
     { text: 'Listing', callback_data: 'menu_listing' },
     { text: 'Manage Listing', callback_data: 'menu_manage' },
   ]];
-  rows.push([{ text: 'Mint', callback_data: 'menu_mint' }, { text: 'Settings', callback_data: 'menu_settings' }]);
+  rows.push([{ text: 'Mint', callback_data: 'menu_mint' }, { text: 'Schedule Mint', callback_data: 'menu_schedules' }]);
+  rows.push([{ text: 'Settings', callback_data: 'menu_settings' }]);
   if (manageAddress) {
     rows.push([{ text: 'Manage this collection', callback_data: 'manage_recent' }]);
   }
@@ -834,6 +835,74 @@ async function executeMint(chatId, session) {
   endAndReturnToMenu(chatId, out.text.slice(0, 3900));
 }
 
+// ---- Manage scheduled mints ----
+
+const SCHED_MIN_LABEL = (s) => `${s.collection.split(' ')[0]}-${(s.label || '?').slice(0, 14)}`;
+
+function renderScheduleList(chatId, session) {
+  const pending = schedules.list();
+  session.step = 'schedule_manage_list';
+  sessionStore.setSession(chatId, session, bot);
+  if (pending.length === 0) {
+    return bot.sendMessage(chatId, 'No active scheduled mint.\n\nCreate one: Mint → paste CA → [Set schedule mint]', {
+      reply_markup: { inline_keyboard: [[{ text: 'Menu', callback_data: 'menu_home' }]] },
+    });
+  }
+  const now = Date.now();
+  const lines = pending.map((s) => {
+    const mins = Math.round((s.startMs - now) / 60000);
+    const when = mins > 0 ? `in ${mins < 60 ? mins + 'm' : Math.round(mins / 60) + 'h'}` : 'FIRING SOON';
+    return `${SCHED_MIN_LABEL(s)} — ${when}`;
+  });
+  bot.sendMessage(chatId, `Scheduled mints (${pending.length}):\n${lines.join('\n')}`, {
+    reply_markup: {
+      inline_keyboard: [
+        ...pending.map((s) => [{ text: SCHED_MIN_LABEL(s), callback_data: `schd_${s.id}` }]),
+        [{ text: 'Menu', callback_data: 'menu_home' }],
+      ],
+    },
+  });
+}
+
+function renderScheduleDetail(chatId, session, s) {
+  const now = Date.now();
+  const mins = Math.round((s.startMs - now) / 60000);
+  session.step = 'schedule_manage_detail';
+  session.data.schdId = s.id;
+  sessionStore.setSession(chatId, session, bot);
+  const total = ethers.parseEther(String(s.priceEth ?? 0)) * BigInt(s.qty) * BigInt(s.wallets.length);
+  bot.sendMessage(
+    chatId,
+    `${SCHED_MIN_LABEL(s)} (#${s.id})\n${s.collection} — ${s.label}\n${mint.fmtRangeWIB(s.startMs, s.endMs)} WIB\nMint: ${s.wallets.length} wallet × ${s.qty} @ ${s.priceEth} ETH = ${ethers.formatEther(total)} ETH + gas\nWallets: ${s.wallets.map((i) => shortAddr(walletAddresses[i])).join(', ')}\n\nFires in ${mins} minute(s).`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: '⟳ Refresh', callback_data: `schd_${s.id}` },
+            { text: 'Change max mint', callback_data: 'schd_qty' },
+          ],
+          [{ text: 'Close', callback_data: 'schd_close' }],
+          [{ text: 'Menu', callback_data: 'menu_home' }],
+        ],
+      },
+    },
+  );
+}
+
+function showScheduleList(chatId, session) {
+  session.flow = 'manage';
+  session.data = session.data || {};
+  renderScheduleList(chatId, session);
+}
+
+function showScheduleDetail(chatId, session, id) {
+  const s = schedules.list().find((x) => x.id === id);
+  if (!s) return endAndReturnToMenu(chatId, 'Schedule not found or already fired/cancelled.');
+  session.flow = 'manage';
+  session.data = session.data || {};
+  renderScheduleDetail(chatId, session, s);
+}
+
 // ---- Schedule auto-mint ----
 
 const SCH_PAGE = 5;
@@ -1096,6 +1165,22 @@ async function handleStep(chatId, session, text) {
       break;
     }
 
+    case 'schedule_manage_qty': {
+      const qty = parseInt(text, 10);
+      const s = schedules.list().find((x) => x.id === session.data.schdId);
+      if (!s) return endAndReturnToMenu(chatId, 'Schedule already fired/cancelled.');
+      const max = s.maxPerWallet ?? 100;
+      if (!Number.isInteger(qty) || qty < 1 || qty > max) {
+        bot.sendMessage(chatId, `Enter a count between 1 and ${max}:`);
+        return;
+      }
+      s.qty = qty;
+      const all = JSON.parse(fs.readFileSync(path.join(__dirname, 'mint-schedules.json'), 'utf8'));
+      const ent = all.find((x) => x.id === s.id);
+      if (ent) { ent.qty = qty; fs.writeFileSync(path.join(__dirname, 'mint-schedules.json'), JSON.stringify(all, null, 2)); }
+      return showScheduleDetail(chatId, session, s.id);
+    }
+
     case 'schedule_bulk_count': {
       const n = parseInt(text, 10);
       const eligReasons = stageReasons(session, session.data.schStage);
@@ -1311,7 +1396,7 @@ async function handleCallback(chatId, query) {
   }
 
   // Menu buttons always work, even on an old menu message or after a restart/timeout.
-  if (['menu_listing', 'menu_manage', 'menu_fastlist', 'menu_settings', 'menu_mint'].includes(query.data)) {
+  if (['menu_listing', 'menu_manage', 'menu_fastlist', 'menu_settings', 'menu_mint', 'menu_schedules'].includes(query.data)) {
     console.log(`menu tap: ${query.data}`);
     if (isBusy(chatId)) {
       return bot.answerCallbackQuery(query.id, { text: 'Still executing, please wait' });
@@ -1338,6 +1423,10 @@ async function handleCallback(chatId, query) {
 
     if (query.data === 'menu_settings') {
       return showFastSettings(chatId);
+    }
+
+    if (query.data === 'menu_schedules') {
+      return showScheduleList(chatId, session);
     }
 
     sessionStore.setSession(chatId, { flow: 'manage', step: 'awaiting_mode', data: {} }, bot);
@@ -1477,6 +1566,32 @@ async function handleCallback(chatId, query) {
     return showMainMenu(chatId);
   }
 
+  if (query.data === 'schd_qty') {
+    if (session.step !== 'schedule_manage_detail') {
+      return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
+    }
+    await bot.answerCallbackQuery(query.id);
+    const s = schedules.list().find((x) => x.id === session.data.schdId);
+    if (!s) return endAndReturnToMenu(chatId, 'Schedule already fired/cancelled.');
+    session.step = 'schedule_manage_qty';
+    sessionStore.setSession(chatId, session, bot);
+    return bot.sendMessage(chatId, `How many per wallet? (1-${s.maxPerWallet ?? 100})`);
+  }
+
+  if (query.data === 'schd_close') {
+    if (session.step !== 'schedule_manage_detail') {
+      return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
+    }
+    await bot.answerCallbackQuery(query.id);
+    schedules.cancel(session.data.schdId);
+    return endAndReturnToMenu(chatId, `Schedule #${session.data.schdId} cancelled ✓`);
+  }
+
+  if (query.data.startsWith('schd_')) {
+    await bot.answerCallbackQuery(query.id);
+    return showScheduleDetail(chatId, session, query.data.slice(5));
+  }
+
   if (query.data === 'menu_sch') {
     if (session.step !== 'mint_stages') {
       return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
@@ -1603,6 +1718,7 @@ async function handleCallback(chatId, query) {
       slug: session.data.slug,
       collection: session.data.collection,
       stageIndex: stage.index,
+      maxPerWallet: stage.maxPerWallet ?? null,
       label: stage.label,
       type: stage.type,
       startMs: stage.start,
