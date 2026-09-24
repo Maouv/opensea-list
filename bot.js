@@ -1440,7 +1440,7 @@ async function handleCallback(chatId, query) {
     }
 
     if (query.data === 'menu_schedules') {
-      return showScheduleList(chatId, session);
+      return showScheduleList(chatId, sessionStore.getSession(chatId));
     }
 
     sessionStore.setSession(chatId, { flow: 'manage', step: 'awaiting_mode', data: {} }, bot);
