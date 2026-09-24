@@ -544,19 +544,22 @@ async function resolveMint(chatId, session, chainInput) {
   session.data.chain = opensea.CHAIN_MAP[chainInput];
   session.data.provider = provider;
 
-  const result = await mint.detect(provider, session.data.contractAddress);
+  const minter = walletAddresses[0];
+  const result = await mint.detect(provider, session.data.contractAddress, minter);
   console.log(`mint probe ${chainInput}:`, JSON.stringify(result, (_, v) => (typeof v === 'bigint' ? v.toString() : v)));
   if (result.error) return endAndReturnToMenu(chatId, result.error);
   session.data.mintSig = result.sig;
   session.data.mintName = result.name;
+  session.data.collection = await mint.collectionName(provider, session.data.contractAddress) || shortAddr(session.data.contractAddress);
+  session.data.minted = result.minted;
 
   if (!result.active && result.needsPrice) {
     session.step = 'awaiting_mint_price';
     sessionStore.setSession(chatId, session, bot);
-    return bot.sendMessage(chatId, `Found ${result.sig} but price not auto-detected (${result.reason}). Enter mint price (0 = free):`);
+    return bot.sendMessage(chatId, `Found ${result.name} (${session.data.collection}) but price not auto-detected (${result.reason}). Enter mint price (0 = free):`);
   }
   if (!result.active) {
-    return endAndReturnToMenu(chatId, `Mint function found but not available now: ${result.reason}`);
+    return endAndReturnToMenu(chatId, `Mint found (${session.data.collection}) but not available now: ${result.reason}`);
   }
   session.data.priceWei = result.price;
   askMintQty(chatId, session);
@@ -595,9 +598,10 @@ async function goToMintSummary(chatId, session, indexes) {
   const lines = session.data.selections
     .map((s) => `${shortAddr(s.wallet.address)}: mint ${s.qty} × ${ethers.formatEther(session.data.priceWei)} = ${ethers.formatEther(session.data.priceWei * BigInt(s.qty))}`)
     .join('\n');
+  const mintedLine = session.data.minted != null ? `\nWallet[0] already minted: ${session.data.minted}` : '';
   session.step = 'awaiting_confirm';
   sessionStore.setSession(chatId, session, bot);
-  bot.sendMessage(chatId, `--- Mint Summary ---\n${lines}\nTotal: ${ethers.formatEther(total)} + gas`, {
+  bot.sendMessage(chatId, `--- Mint Summary ---\n${session.data.collection}\n${lines}\nTotal: ${ethers.formatEther(total)} + gas${mintedLine}`, {
     reply_markup: {
       inline_keyboard: [[
         { text: 'Yes', callback_data: 'confirm_yes' },
@@ -614,14 +618,15 @@ async function executeMint(chatId, session) {
   const iface = new ethers.Interface([`function ${session.data.mintSig} payable`]);
   const value = session.data.priceWei * BigInt(session.data.mintQty);
 
-  const [network, feeData] = await Promise.all([provider.getNetwork(), provider.getFeeData()]);
-  const probeContract = new ethers.Contract(session.data.contractAddress, iface, provider).connect(session.data.selections[0].wallet);
+  const [network, feeData, blockAtStart] = await Promise.all([provider.getNetwork(), provider.getFeeData(), provider.getBlockNumber()]);
+  const probeWallet = session.data.selections[0].wallet;
+  const probeContract = new ethers.Contract(session.data.contractAddress, iface, provider).connect(probeWallet);
   const gasLimit = await probeContract[session.data.mintName]
-    .estimateGas(session.data.mintQty, { value })
+    .estimateGas(...mint.mintArgs(session.data.mintSig, probeWallet.address, session.data.mintQty), { value })
     .then((g) => (g * 120n) / 100n)
     .catch(() => 600000n);
 
-  bot.sendMessage(chatId, `Minting ${session.data.selections.length} wallet(s)...`);
+  bot.sendMessage(chatId, `Minting ${session.data.collection}: ${session.data.selections.length} wallet(s), block ${blockAtStart}...`);
   const results = await Promise.all(session.data.selections.map(async (sel) => {
     const base = { wallet: sel.wallet.address };
     try {
@@ -633,7 +638,7 @@ async function executeMint(chatId, session) {
       if (balance < value + maxGasCost) return { ...base, status: 'skipped', error: 'insufficient balance' };
       const tx = {
         to: session.data.contractAddress,
-        data: iface.encodeFunctionData(session.data.mintName, [session.data.mintQty]),
+        data: iface.encodeFunctionData(session.data.mintName, mint.mintArgs(session.data.mintSig, sel.wallet.address, session.data.mintQty)),
         value,
         nonce,
         chainId: network.chainId,
@@ -646,21 +651,48 @@ async function executeMint(chatId, session) {
       } else {
         tx.gasPrice = feeData.gasPrice;
       }
+      const t0 = Date.now();
       const signed = await sel.wallet.signTransaction(tx);
       const sent = await provider.broadcastTransaction(signed);
+      const msBroadcast = Date.now() - t0;
       const receipt = await Promise.race([sent.wait(), new Promise((resolve) => setTimeout(() => resolve(null), 60000))]);
-      if (!receipt) return { ...base, status: 'pending', hash: sent.hash };
-      return receipt.status === 1 ? { ...base, status: 'ok', hash: sent.hash } : { ...base, status: 'failed', error: 'mint reverted on-chain' };
+      if (!receipt) return { ...base, status: 'pending', hash: sent.hash, msBroadcast };
+      return receipt.status === 1
+        ? { ...base, status: 'ok', hash: sent.hash, msBroadcast, msConfirm: Date.now() - t0, block: receipt.blockNumber }
+        : { ...base, status: 'failed', error: 'mint reverted on-chain', msBroadcast, msConfirm: Date.now() - t0, block: receipt.blockNumber };
     } catch (err) {
       return { ...base, status: 'failed', error: err.message.slice(0, 150) };
     }
   }));
 
   const count = (status) => results.filter((r) => r.status === status).length;
-  let text = `Mint done. Success: ${count('ok')}, failed: ${count('failed')}, skipped: ${count('skipped')}, pending: ${count('pending')}`;
+  let text = `Mint done — ${session.data.collection}\nBlock start: ${blockAtStart}. Success: ${count('ok')}, failed: ${count('failed')}, skipped: ${count('skipped')}, pending: ${count('pending')}`;
   for (const r of results) {
-    text += r.hash ? `\n${shortAddr(r.wallet)}: ${r.status} ${r.hash}` : `\n${shortAddr(r.wallet)}: ${r.error}`;
+    const timing = r.msBroadcast != null ? ` [${r.msBroadcast}ms broadcast${r.msConfirm != null ? `, ${r.msConfirm}ms confirmed${r.block ? `, block ${r.block}` : ''}]` : ']'}` : '';
+    text += r.hash ? `\n${shortAddr(r.wallet)}: ${r.status} ${r.hash}${timing}` : `\n${shortAddr(r.wallet)}: ${r.error}`;
   }
+  const historyPath = path.join(__dirname, 'mint-history.json');
+  let history = [];
+  try { history = JSON.parse(fs.readFileSync(historyPath, 'utf8')); } catch {}
+  history.push({
+    ts: new Date().toISOString(),
+    chain: session.data.chainInput,
+    ca: session.data.contractAddress,
+    collection: session.data.collection,
+    price: ethers.formatEther(session.data.priceWei),
+    qtyPerWallet: session.data.mintQty,
+    blockAtStart,
+    wallets: results.map((r) => ({
+      addr: r.wallet,
+      status: r.status,
+      hash: r.hash || null,
+      msBroadcast: r.msBroadcast ?? null,
+      msConfirm: r.msConfirm ?? null,
+      block: r.block ?? null,
+      error: r.error || null,
+    })),
+  });
+  fs.writeFileSync(historyPath, JSON.stringify(history, null, 2));
   endAndReturnToMenu(chatId, text.slice(0, 3900));
 }
 
@@ -699,12 +731,13 @@ async function handleStep(chatId, session, text) {
         bot.sendMessage(chatId, 'Invalid price, try again (0 = free):');
         return;
       }
-      const check = await mint.checkWithPrice(session.data.provider, session.data.contractAddress, session.data.mintSig, wei);
+      const check = await mint.checkWithPrice(session.data.provider, session.data.contractAddress, walletAddresses[0], session.data.mintSig, wei);
       if (!check.active) {
         endAndReturnToMenu(chatId, `Mint still not available: ${check.reason}`);
         return;
       }
       session.data.priceWei = wei;
+      session.data.collection = session.data.collection || await mint.collectionName(session.data.provider, session.data.contractAddress) || shortAddr(session.data.contractAddress);
       askMintQty(chatId, session);
       break;
     }

@@ -13,7 +13,9 @@ Reprice: cancels the current listing and creates a new one at the new price.
 Close: cancels the listing.
 
 Mint
-Mints from one or more wallets on public drops. Send a contract address and the bot finds the chain, probes the contract for a public mint function (mint(uint256), mintSeaDrop(uint256), publicMint(uint256)) and reads the mint price from common price getters. You pick how many per wallet and which wallets, confirm, and every wallet broadcasts in parallel with nonces and fees fetched up front. Wallets without enough native balance for the mint plus gas are skipped automatically.
+Mints from one or more wallets on public drops. Send a contract address and the bot finds the chain, probes the contract for a public mint function (mint(uint256), mintSeaDrop(address,uint256), publicMint(uint256)) and reads the mint price from common price getters. If no price getter exists (SeaDrop-style drops), the bot asks for the price and validates it with a simulation before continuing. You pick how many per wallet and which wallets, confirm, and every wallet broadcasts in parallel with nonces and fees fetched up front. Wallets without enough native balance for the mint plus gas are skipped automatically.
+
+The summary shows the collection name, per-wallet totals, and how many wallet[0] has already minted. Reverts are translated to plain language where possible (allowlist phase, sale window with dates, per-wallet limit, supply exhausted, wrong price with the expected amount). The result reports the block at start, per-wallet broadcast time in ms, confirmation time in ms, and the block the mint landed in. Every mint is appended to mint-history.json (timestamp, chain, contract, collection, price, per-wallet status/timings/tx hashes) for later analysis.
 
 Every action ends with a summary and a Yes/No confirmation before anything is executed. Before each token is processed, the bot checks on chain that the wallet still owns it, so tokens sold in the meantime are skipped.
 
