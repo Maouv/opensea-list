@@ -4,6 +4,7 @@ const { ethers } = require('ethers');
 const opensea = require('./lib/opensea');
 const holdings = require('./lib/holdings');
 const sessionStore = require('./lib/session');
+const mint = require('./lib/mint');
 const fs = require('fs');
 const path = require('path');
 
@@ -88,7 +89,7 @@ function showMainMenu(chatId, notice, manageAddress) {
     { text: 'Listing', callback_data: 'menu_listing' },
     { text: 'Manage Listing', callback_data: 'menu_manage' },
   ]];
-  rows.push([{ text: 'Settings', callback_data: 'menu_settings' }]);
+  rows.push([{ text: 'Mint', callback_data: 'menu_mint' }, { text: 'Settings', callback_data: 'menu_settings' }]);
   if (manageAddress) {
     rows.push([{ text: 'Manage this collection', callback_data: 'manage_recent' }]);
   }
@@ -322,6 +323,10 @@ async function detectChainHoldings(address) {
   }));
 }
 
+function resolveForFlow(chatId, session, chainInput) {
+  return session.flow === 'mint' ? resolveMint(chatId, session, chainInput) : resolveCollectionAndWallets(chatId, session, chainInput);
+}
+
 async function resolveCollectionAndWallets(chatId, session, chainInput) {
   const chain = opensea.CHAIN_MAP[chainInput];
   const provider = providers[chainInput];
@@ -476,6 +481,7 @@ function promptContract(chatId, session) {
 }
 
 async function startDetection(chatId, session) {
+  if (session.flow === 'mint') return startMintDetection(chatId, session);
   session.step = 'detecting_chain';
   sessionStore.setSession(chatId, session, bot);
   bot.sendMessage(chatId, 'Scanning chains...');
@@ -502,6 +508,162 @@ async function startDetection(chatId, session) {
   }
 }
 
+async function startMintDetection(chatId, session) {
+  session.step = 'detecting_chain';
+  sessionStore.setSession(chatId, session, bot);
+  bot.sendMessage(chatId, 'Scanning chains for contract...');
+  const present = await Promise.all(Object.entries(providers).map(async ([name, provider]) => {
+    const code = await provider.getCode(session.data.contractAddress).catch(() => '0x');
+    return [name, code !== '0x'];
+  }));
+  console.log(`mint chain detect ${session.data.contractAddress}:`, JSON.stringify(present));
+  const live = present.filter(([, exists]) => exists).map(([name]) => name);
+  if (live.length === 1) {
+    bot.sendMessage(chatId, `Chain detected: ${live[0]}`);
+    return resolveMint(chatId, session, live[0]);
+  }
+  if (live.length > 1) {
+    session.step = 'awaiting_chain_pick';
+    sessionStore.setSession(chatId, session, bot);
+    return bot.sendMessage(chatId, 'Contract exists on multiple chains, pick one:', {
+      reply_markup: { inline_keyboard: [live.map((name) => ({ text: name, callback_data: `chain_${name}` }))] },
+    });
+  }
+  session.step = 'awaiting_chain';
+  sessionStore.setSession(chatId, session, bot);
+  bot.sendMessage(chatId, 'Contract not found on any configured chain. Chain manually (ethereum/polygon/base/arc/robinhood, d = ethereum):');
+}
+
+async function resolveMint(chatId, session, chainInput) {
+  const provider = providers[chainInput];
+  if (!provider) {
+    console.log(`abort: no RPC for ${chainInput}`);
+    return endAndReturnToMenu(chatId, `No RPC_URL configured for "${chainInput}" in .env, aborting`);
+  }
+  session.data.chainInput = chainInput;
+  session.data.chain = opensea.CHAIN_MAP[chainInput];
+  session.data.provider = provider;
+
+  const result = await mint.detect(provider, session.data.contractAddress);
+  console.log(`mint probe ${chainInput}:`, JSON.stringify(result, (_, v) => (typeof v === 'bigint' ? v.toString() : v)));
+  if (result.error) return endAndReturnToMenu(chatId, result.error);
+  session.data.mintSig = result.sig;
+  session.data.mintName = result.name;
+
+  if (!result.active && result.needsPrice) {
+    session.step = 'awaiting_mint_price';
+    sessionStore.setSession(chatId, session, bot);
+    return bot.sendMessage(chatId, `Found ${result.sig} but price not auto-detected (${result.reason}). Enter mint price (0 = free):`);
+  }
+  if (!result.active) {
+    return endAndReturnToMenu(chatId, `Mint function found but not available now: ${result.reason}`);
+  }
+  session.data.priceWei = result.price;
+  askMintQty(chatId, session);
+}
+
+function askMintQty(chatId, session) {
+  session.step = 'awaiting_mint_qty';
+  sessionStore.setSession(chatId, session, bot);
+  bot.sendMessage(chatId, `Mint detected: ${session.data.mintSig} at ${ethers.formatEther(session.data.priceWei)} each. How many per wallet?`);
+}
+
+async function askMintWallets(chatId, session) {
+  const balances = await Promise.all(walletAddresses.map((a) => session.data.provider.getBalance(a)));
+  const lines = walletAddresses.map((a, i) => `${i + 1}. ${shortAddr(a)} — ${Number(ethers.formatEther(balances[i])).toFixed(4)}`).join('\n');
+  session.step = 'awaiting_mint_wallets';
+  sessionStore.setSession(chatId, session, bot);
+  bot.sendMessage(chatId, `Wallet balance (native):\n${lines}\n\nWhich wallets mint? (e.g. 1,3 or all)`);
+}
+
+function parseMintWallets(text) {
+  const answer = text.trim().toLowerCase();
+  if (answer === 'all') return walletAddresses.map((_, i) => i);
+  return answer
+    .split(',')
+    .map((part) => parseInt(part.trim(), 10) - 1)
+    .filter((i) => Number.isInteger(i) && i >= 0 && i < walletAddresses.length);
+}
+
+async function goToMintSummary(chatId, session, indexes) {
+  if (indexes.length === 0) return endAndReturnToMenu(chatId, 'Nothing selected, aborting');
+  session.data.selections = indexes.map((i) => ({
+    wallet: new ethers.Wallet(PRIVATE_KEYS[i], session.data.provider),
+    qty: session.data.mintQty,
+  }));
+  const total = session.data.selections.reduce((sum, s) => sum + session.data.priceWei * BigInt(s.qty), 0n);
+  const lines = session.data.selections
+    .map((s) => `${shortAddr(s.wallet.address)}: mint ${s.qty} × ${ethers.formatEther(session.data.priceWei)} = ${ethers.formatEther(session.data.priceWei * BigInt(s.qty))}`)
+    .join('\n');
+  session.step = 'awaiting_confirm';
+  sessionStore.setSession(chatId, session, bot);
+  bot.sendMessage(chatId, `--- Mint Summary ---\n${lines}\nTotal: ${ethers.formatEther(total)} + gas`, {
+    reply_markup: {
+      inline_keyboard: [[
+        { text: 'Yes', callback_data: 'confirm_yes' },
+        { text: 'No', callback_data: 'confirm_no' },
+      ]],
+    },
+  });
+}
+
+async function executeMint(chatId, session) {
+  session.step = 'executing';
+  sessionStore.setSession(chatId, session, bot);
+  const provider = session.data.provider;
+  const iface = new ethers.Interface([`function ${session.data.mintSig} payable`]);
+  const value = session.data.priceWei * BigInt(session.data.mintQty);
+
+  const [network, feeData] = await Promise.all([provider.getNetwork(), provider.getFeeData()]);
+  const probeContract = new ethers.Contract(session.data.contractAddress, iface, provider).connect(session.data.selections[0].wallet);
+  const gasLimit = await probeContract[session.data.mintName]
+    .estimateGas(session.data.mintQty, { value })
+    .then((g) => (g * 120n) / 100n)
+    .catch(() => 600000n);
+
+  bot.sendMessage(chatId, `Minting ${session.data.selections.length} wallet(s)...`);
+  const results = await Promise.all(session.data.selections.map(async (sel) => {
+    const base = { wallet: sel.wallet.address };
+    try {
+      const [balance, nonce] = await Promise.all([
+        provider.getBalance(sel.wallet.address),
+        provider.getTransactionCount(sel.wallet.address, 'pending'),
+      ]);
+      const maxGasCost = gasLimit * (feeData.maxFeePerGas ?? feeData.gasPrice);
+      if (balance < value + maxGasCost) return { ...base, status: 'skipped', error: 'insufficient balance' };
+      const tx = {
+        to: session.data.contractAddress,
+        data: iface.encodeFunctionData(session.data.mintName, [session.data.mintQty]),
+        value,
+        nonce,
+        chainId: network.chainId,
+        gasLimit,
+      };
+      if (feeData.maxFeePerGas) {
+        tx.type = 2;
+        tx.maxFeePerGas = feeData.maxFeePerGas;
+        tx.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas;
+      } else {
+        tx.gasPrice = feeData.gasPrice;
+      }
+      const signed = await sel.wallet.signTransaction(tx);
+      const sent = await provider.broadcastTransaction(signed);
+      const receipt = await Promise.race([sent.wait(), new Promise((resolve) => setTimeout(() => resolve(null), 60000))]);
+      if (!receipt) return { ...base, status: 'pending', hash: sent.hash };
+      return receipt.status === 1 ? { ...base, status: 'ok', hash: sent.hash } : { ...base, status: 'failed', error: 'mint reverted on-chain' };
+    } catch (err) {
+      return { ...base, status: 'failed', error: err.message.slice(0, 150) };
+    }
+  }));
+
+  const count = (status) => results.filter((r) => r.status === status).length;
+  let text = `Mint done. Success: ${count('ok')}, failed: ${count('failed')}, skipped: ${count('skipped')}, pending: ${count('pending')}`;
+  for (const r of results) {
+    text += r.hash ? `\n${shortAddr(r.wallet)}: ${r.status} ${r.hash}` : `\n${shortAddr(r.wallet)}: ${r.error}`;
+  }
+  endAndReturnToMenu(chatId, text.slice(0, 3900));
+}
+
 async function handleStep(chatId, session, text) {
   switch (session.step) {
     case 'awaiting_contract': {
@@ -524,7 +686,42 @@ async function handleStep(chatId, session, text) {
         return;
       }
 
-      await resolveCollectionAndWallets(chatId, session, chainInput);
+      await resolveForFlow(chatId, session, chainInput);
+      break;
+    }
+
+    case 'awaiting_mint_price': {
+      let wei = null;
+      try {
+        wei = ethers.parseEther(text.trim());
+      } catch {}
+      if (wei === null || wei < 0n) {
+        bot.sendMessage(chatId, 'Invalid price, try again (0 = free):');
+        return;
+      }
+      const check = await mint.checkWithPrice(session.data.provider, session.data.contractAddress, session.data.mintSig, wei);
+      if (!check.active) {
+        endAndReturnToMenu(chatId, `Mint still not available: ${check.reason}`);
+        return;
+      }
+      session.data.priceWei = wei;
+      askMintQty(chatId, session);
+      break;
+    }
+
+    case 'awaiting_mint_qty': {
+      const qty = parseInt(text, 10);
+      if (!Number.isInteger(qty) || qty < 1 || qty > 100) {
+        bot.sendMessage(chatId, 'Enter a count between 1 and 100:');
+        return;
+      }
+      session.data.mintQty = qty;
+      await askMintWallets(chatId, session);
+      break;
+    }
+
+    case 'awaiting_mint_wallets': {
+      await goToMintSummary(chatId, session, parseMintWallets(text));
       break;
     }
 
@@ -699,7 +896,7 @@ async function handleCallback(chatId, query) {
   }
 
   // Menu buttons always work, even on an old menu message or after a restart/timeout.
-  if (['menu_listing', 'menu_manage', 'menu_fastlist', 'menu_settings'].includes(query.data)) {
+  if (['menu_listing', 'menu_manage', 'menu_fastlist', 'menu_settings', 'menu_mint'].includes(query.data)) {
     console.log(`menu tap: ${query.data}`);
     if (isBusy(chatId)) {
       return bot.answerCallbackQuery(query.id, { text: 'Still executing, please wait' });
@@ -709,6 +906,12 @@ async function handleCallback(chatId, query) {
 
     if (query.data === 'menu_listing') {
       const session = { flow: 'list', step: 'awaiting_contract', data: {} };
+      sessionStore.setSession(chatId, session, bot);
+      return promptContract(chatId, session);
+    }
+
+    if (query.data === 'menu_mint') {
+      const session = { flow: 'mint', step: 'awaiting_contract', data: {} };
       sessionStore.setSession(chatId, session, bot);
       return promptContract(chatId, session);
     }
@@ -773,13 +976,17 @@ async function handleCallback(chatId, query) {
     return promptContract(chatId, session);
   }
 
-  if (query.data === 'start_list' || query.data === 'start_manage') {
+  if (query.data === 'start_list' || query.data === 'start_manage' || query.data === 'start_mint') {
     if (session.step !== 'awaiting_start_mode') {
       return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
     }
     await bot.answerCallbackQuery(query.id);
     if (query.data === 'start_list') {
       session.flow = 'list';
+      return startDetection(chatId, session);
+    }
+    if (query.data === 'start_mint') {
+      session.flow = 'mint';
       return startDetection(chatId, session);
     }
     if (query.data === 'start_fastlist') {
@@ -846,7 +1053,7 @@ async function handleCallback(chatId, query) {
       return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
     }
     await bot.answerCallbackQuery(query.id);
-    return resolveCollectionAndWallets(chatId, session, query.data.slice(6));
+    return resolveForFlow(chatId, session, query.data.slice(6));
   }
 
   if (query.data === 'mode_separate' || query.data === 'mode_bulk') {
@@ -882,7 +1089,7 @@ async function handleCallback(chatId, query) {
       return endAndReturnToMenu(chatId, 'Cancelled');
     }
 
-    return executeAction(chatId, session);
+    return session.flow === 'mint' ? executeMint(chatId, session) : executeAction(chatId, session);
   }
 }
 
@@ -904,6 +1111,8 @@ bot.on('message', async (msg) => {
           { text: 'Fast List', callback_data: 'start_fastlist' },
           { text: 'Listing', callback_data: 'start_list' },
           { text: 'Manage Listing', callback_data: 'start_manage' },
+        ], [
+          { text: 'Mint', callback_data: 'start_mint' },
         ]],
       },
     });

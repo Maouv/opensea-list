@@ -12,6 +12,9 @@ Works on existing active listings for a collection.
 Reprice: cancels the current listing and creates a new one at the new price.
 Close: cancels the listing.
 
+Mint
+Mints from one or more wallets on public drops. Send a contract address and the bot finds the chain, probes the contract for a public mint function (mint(uint256), mintSeaDrop(uint256), publicMint(uint256)) and reads the mint price from common price getters. You pick how many per wallet and which wallets, confirm, and every wallet broadcasts in parallel with nonces and fees fetched up front. Wallets without enough native balance for the mint plus gas are skipped automatically.
+
 Every action ends with a summary and a Yes/No confirmation before anything is executed. Before each token is processed, the bot checks on chain that the wallet still owns it, so tokens sold in the meantime are skipped.
 
 ## Supported chains
