@@ -870,13 +870,18 @@ async function enterScheduleMenu(chatId, session) {
 async function enterSchWalletMenu(chatId, session, stage) {
   session.data.schStage = stage;
   session.data.schSel = [];
-  const balances = await Promise.all(walletAddresses.map((a) => session.data.provider.getBalance(a)));
-  const ready = balances.filter((b) => b > 0n).length;
+  // eligibility first (cached from the stages matrix), balance only as fallback
+  const stageElig = (session.data.stageElig || []).find((e) => e.stage.index === stage.index);
+  const eligReasons = stageElig && stageElig.reasons ? stageElig.reasons.filter((r) => r.ok) : null;
+  const eligCount = eligReasons ? eligReasons.length : null;
+  const eligLine = eligCount != null
+    ? `${eligCount}/${walletAddresses.length} eligible${eligReasons.length ? ' — ' + eligReasons.map((r) => shortAddr(r.minter)).join(', ') : ''}`
+    : `${walletAddresses.length} wallet ready (balance > 0). Eligibility re-checked at execution.`;
   session.step = 'sch_menu';
   sessionStore.setSession(chatId, session, bot);
   bot.sendMessage(
     chatId,
-    `Stage: ${stage.label}\n${mint.fmtRangeWIB(stage.start, stage.end)} WIB, ${stage.priceEth} ETH, max ${stage.maxPerWallet ?? '?'}/wallet\n${ready}/${walletAddresses.length} wallet ready (balance > 0). WL eligibility is re-checked automatically at execution.`,
+    `Stage: ${stage.label}\n${mint.fmtRangeWIB(stage.start, stage.end)} WIB, ${stage.priceEth} ETH, max ${stage.maxPerWallet ?? '?'}/wallet\n${eligLine}`,
     {
       reply_markup: {
         inline_keyboard: [
@@ -885,6 +890,7 @@ async function enterSchWalletMenu(chatId, session, stage) {
             { text: 'Separate-mint', callback_data: 'sch_sep' },
           ],
           [
+            { text: 'Elig wallet', callback_data: 'sch_elig' },
             { text: 'See all wallet', callback_data: 'sch_seeall' },
             { text: 'Menu', callback_data: 'menu_home' },
           ],
@@ -892,6 +898,22 @@ async function enterSchWalletMenu(chatId, session, stage) {
       },
     },
   );
+}
+
+function renderSchElig(chatId, session) {
+  const stage = session.data.schStage;
+  const stageElig = (session.data.stageElig || []).find((e) => e.stage.index === stage.index);
+  const reasons = stageElig && stageElig.reasons ? stageElig.reasons : null;
+  const lines = reasons
+    ? reasons.map((r, i) => `${i + 1}. ${r.minter}${r.ok ? ' ✓ eligible' : ' ✗'}`).join('\n')
+    : walletAddresses.map((a, i) => `${i + 1}. ${a} (eligibility re-checked at execution)`).join('\n');
+  session.step = 'schedule_seeall';
+  sessionStore.setSession(chatId, session, bot);
+  bot.sendMessage(chatId, `Eligibility — ${stage.label}:\n${lines}`, {
+    reply_markup: {
+      inline_keyboard: [[{ text: 'Back', callback_data: 'sch_back' }]],
+    },
+  });
 }
 
 function renderSchSepPage(chatId, session) {
@@ -1508,6 +1530,14 @@ async function handleCallback(chatId, query) {
       return bot.answerCallbackQuery(query.id, { text: 'Select at least one wallet first' });
     }
     return askSchQty(chatId, session);
+  }
+
+  if (query.data === 'sch_elig') {
+    if (session.step !== 'sch_menu') {
+      return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
+    }
+    await bot.answerCallbackQuery(query.id);
+    return renderSchElig(chatId, session);
   }
 
   if (query.data === 'sch_seeall') {
