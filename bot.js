@@ -553,6 +553,29 @@ async function resolveMint(chatId, session, chainInput) {
   session.data.collection = await mint.collectionName(provider, session.data.contractAddress) || shortAddr(session.data.contractAddress);
   session.data.minted = result.minted;
 
+  const drop = await (async () => {
+    try {
+      const slug = await opensea.getCollectionSlug(chainInput, session.data.contractAddress, OPENSEA_API_KEY);
+      return slug ? await mint.fetchDrop(slug) : null;
+    } catch {
+      return null;
+    }
+  })();
+
+  if (drop && drop.stages.length > 0) {
+    const active = mint.activeStage(drop);
+    if (!active) {
+      return endAndReturnToMenu(chatId, `${session.data.collection} — drop stages:\n${mint.describeStages(drop)}\n\nNo stage open right now, come back when one starts.`);
+    }
+    session.data.dropStage = active;
+    if (active.priceEth != null) {
+      session.data.priceWei = ethers.parseEther(String(active.priceEth));
+      const wlNote = active.type !== 'PUBLIC_SALE' ? `\nNote: active stage is ${active.type} (${active.label}) — wallet must be on its list; the mint simulation decides.` : '';
+      bot.sendMessage(chatId, `${session.data.collection} — drop stages:\n${mint.describeStages(drop)}${wlNote}`);
+      return askMintQty(chatId, session);
+    }
+  }
+
   if (!result.active && result.needsPrice) {
     session.step = 'awaiting_mint_price';
     sessionStore.setSession(chatId, session, bot);
@@ -568,7 +591,9 @@ async function resolveMint(chatId, session, chainInput) {
 function askMintQty(chatId, session) {
   session.step = 'awaiting_mint_qty';
   sessionStore.setSession(chatId, session, bot);
-  bot.sendMessage(chatId, `Mint detected: ${session.data.mintSig} at ${ethers.formatEther(session.data.priceWei)} each. How many per wallet?`);
+  const stage = session.data.dropStage;
+  const stageLine = stage ? `\nStage: ${stage.label} (${stage.type}), max ${stage.maxPerWallet ?? '?'}/wallet` : '';
+  bot.sendMessage(chatId, `Mint detected: ${session.data.mintSig} at ${ethers.formatEther(session.data.priceWei)} each.${stageLine}\nHow many per wallet?`);
 }
 
 async function askMintWallets(chatId, session) {
@@ -599,9 +624,10 @@ async function goToMintSummary(chatId, session, indexes) {
     .map((s) => `${shortAddr(s.wallet.address)}: mint ${s.qty} × ${ethers.formatEther(session.data.priceWei)} = ${ethers.formatEther(session.data.priceWei * BigInt(s.qty))}`)
     .join('\n');
   const mintedLine = session.data.minted != null ? `\nWallet[0] already minted: ${session.data.minted}` : '';
+  const stageLine = session.data.dropStage ? `\nStage: ${session.data.dropStage.label} (${session.data.dropStage.type})` : '';
   session.step = 'awaiting_confirm';
   sessionStore.setSession(chatId, session, bot);
-  bot.sendMessage(chatId, `--- Mint Summary ---\n${session.data.collection}\n${lines}\nTotal: ${ethers.formatEther(total)} + gas${mintedLine}`, {
+  bot.sendMessage(chatId, `--- Mint Summary ---\n${session.data.collection}${stageLine}\n${lines}\nTotal: ${ethers.formatEther(total)} + gas${mintedLine}`, {
     reply_markup: {
       inline_keyboard: [[
         { text: 'Yes', callback_data: 'confirm_yes' },
@@ -679,6 +705,7 @@ async function executeMint(chatId, session) {
     chain: session.data.chainInput,
     ca: session.data.contractAddress,
     collection: session.data.collection,
+    stage: session.data.dropStage ? session.data.dropStage.label : null,
     price: ethers.formatEther(session.data.priceWei),
     qtyPerWallet: session.data.mintQty,
     blockAtStart,
