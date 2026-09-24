@@ -55,6 +55,7 @@ const providers = Object.fromEntries(
     .map(([name, url]) => [name, new ethers.JsonRpcProvider(url)]),
 );
 const walletAddresses = PRIVATE_KEYS.map((pk) => new ethers.Wallet(pk).address);
+const walletWallets = PRIVATE_KEYS.map((pk) => { const w = new ethers.Wallet(pk); return { wallet: w, address: w.address }; });
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
@@ -568,7 +569,7 @@ async function resolveMint(chatId, session, chainInput) {
     session.data.drop = drop;
     const active = mint.activeStage(drop);
     if (!active) {
-      const elig = await mint.computeStageEligibility(drop, provider, session.data.contractAddress, walletAddresses, session.data.mintSig);
+      const elig = await mint.computeStageEligibility(drop, provider, session.data.contractAddress, walletWallets, session.data.mintSig, session.data.slug, OPENSEA_API_KEY);
       session.data.stageElig = elig;
       const upcomingPublic = drop.stages.some((s) => s.type === 'PUBLIC_SALE' && s.start > Date.now());
       session.step = 'mint_stages';
@@ -583,7 +584,7 @@ async function resolveMint(chatId, session, chainInput) {
       );
     }
     session.data.dropStage = active;
-    const elig = await mint.computeStageEligibility(drop, provider, session.data.contractAddress, walletAddresses, session.data.mintSig);
+    const elig = await mint.computeStageEligibility(drop, provider, session.data.contractAddress, walletWallets, session.data.mintSig, session.data.slug, OPENSEA_API_KEY);
     session.data.stageElig = elig;
     const matrix = `${session.data.collection} — drop stages:\n${mint.describeStages(drop, elig)}`;
     const activeElig = elig.find((e) => e.stage.index === active.index);
