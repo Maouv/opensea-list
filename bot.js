@@ -603,10 +603,7 @@ async function resolveMint(chatId, session, chainInput) {
       const keyboard = upcomingPublic
         ? [[{ text: 'Set schedule mint', callback_data: 'menu_sch' }, { text: 'Menu', callback_data: 'menu_home' }]]
         : [[{ text: 'Menu', callback_data: 'menu_home' }]];
-      const why = active.type !== 'PUBLIC_SALE'
-        ? `\n\nActive stage "${active.label}" is ${active.type} — no wallet can plain-mint it (needs an OpenSea signature). The public stage above can be scheduled.`
-        : '\n\nNo wallet eligible for the active stage.';
-      return bot.sendMessage(chatId, matrix + why, { reply_markup: { inline_keyboard: keyboard } });
+      return bot.sendMessage(chatId, matrix, { reply_markup: { inline_keyboard: keyboard } });
     }
     if (active.priceEth != null) {
       session.data.priceWei = ethers.parseEther(String(active.priceEth));
