@@ -7,6 +7,8 @@ const sessionStore = require('./lib/session');
 const mint = require('./lib/mint');
 const minttx = require('./lib/minttx');
 const schedules = require('./lib/schedules');
+const osoffers = require('./lib/osoffers');
+const osauth = require('./lib/osauth');
 const fs = require('fs');
 const path = require('path');
 
@@ -334,7 +336,9 @@ async function detectChainHoldings(address) {
 }
 
 function resolveForFlow(chatId, session, chainInput) {
-  return session.flow === 'mint' ? resolveMint(chatId, session, chainInput) : resolveCollectionAndWallets(chatId, session, chainInput);
+  if (session.flow === 'mint') return resolveMint(chatId, session, chainInput);
+  if (session.flow === 'offer') return offerChainPick(chatId, session, chainInput);
+  return resolveCollectionAndWallets(chatId, session, chainInput);
 }
 
 async function resolveCollectionAndWallets(chatId, session, chainInput) {
@@ -832,6 +836,113 @@ async function executeMint(chatId, session) {
   endAndReturnToMenu(chatId, out.text.slice(0, 3900));
 }
 
+// ---- Acc offer flow: paste CA -> owned tokens -> offers -> accept ----
+
+const OF_PAGE = 5;
+
+// token ids held by each wallet on chain, plus chain pick for multi-chain CA
+async function startOfferFlow(chatId, session) {
+  session.step = 'detecting_chain';
+  sessionStore.setSession(chatId, session, bot);
+  bot.sendMessage(chatId, 'Scanning chains...');
+  const counts = await detectChainHoldings(session.data.contractAddress);
+  const withHoldings = counts.filter(([, total]) => total > 0);
+  if (withHoldings.length === 1) {
+    bot.sendMessage(chatId, `Chain detected: ${withHoldings[0][0]} (${withHoldings[0][1]} NFT)`);
+    return offerChainPick(chatId, session, withHoldings[0][0]);
+  }
+  if (withHoldings.length > 1) {
+    session.step = 'awaiting_chain_pick';
+    sessionStore.setSession(chatId, session, bot);
+    return bot.sendMessage(chatId, 'Holdings on multiple chains, pick one:', {
+      reply_markup: { inline_keyboard: [withHoldings.map(([name, total]) => ({ text: `${name} (${total})`, callback_data: `chain_${name}` }))] },
+    });
+  }
+  return endAndReturnToMenu(chatId, 'No holdings found on any configured chain');
+}
+
+async function offerChainPick(chatId, session, chainInput) {
+  const provider = providers[chainInput];
+  if (!provider) return endAndReturnToMenu(chatId, `No RPC for ${chainInput}`);
+  session.data.chainInput = chainInput;
+  session.data.chain = opensea.CHAIN_MAP[chainInput];
+  session.data.provider = provider;
+  const slug = await opensea.getCollectionSlug(chainInput, session.data.contractAddress, OPENSEA_API_KEY);
+  if (!slug) return endAndReturnToMenu(chatId, 'Could not resolve collection, aborting');
+  session.data.slug = slug;
+  rememberCa({ address: session.data.contractAddress, chain: chainInput, slug });
+  session.data.collection = await mint.collectionName(provider, session.data.contractAddress) || slug;
+
+  const owned = await Promise.all(PRIVATE_KEYS.map(async (pk) => {
+    const wallet = new ethers.Wallet(pk, provider);
+    const sdk = opensea.makeSdk(wallet, session.data.chain, OPENSEA_API_KEY);
+    const balance = await holdings.getHoldings({
+      provider,
+      contractAddress: session.data.contractAddress,
+      wallet: wallet.address,
+      loadCandidates: (b) => opensea.getOwnedTokenIds(sdk, wallet.address, session.data.contractAddress, { stopAt: b }),
+    });
+    return { wallet, ids: balance.ids };
+  }));
+  session.data.owned = owned.filter((w) => w.ids.length > 0);
+  if (session.data.owned.length === 0) {
+    return endAndReturnToMenu(chatId, `No ${session.data.collection} NFT in any wallet`);
+  }
+  return renderOfferTokens(chatId, session);
+}
+
+function renderOfferTokens(chatId, session) {
+  const lines = session.data.owned.map((w, i) => {
+    const ids = w.ids.length > 8 ? `${w.ids.slice(0, 8).join(', ')} +${w.ids.length - 8} more` : w.ids.join(', ');
+    return `${i + 1}. ${shortAddr(w.wallet.address)} (${w.ids.length}) — #${ids}`;
+  });
+  session.step = 'awaiting_offer_token';
+  sessionStore.setSession(chatId, session, bot);
+  bot.sendMessage(chatId, `${session.data.collection} — held tokens:\n${lines.join('\n')}\n\nWhich token id? (e.g. ${session.data.owned[0].ids[0]})`);
+}
+
+async function showTokenOffers(chatId, session) {
+  const { chainInput, slug, offerTokenId } = session.data;
+  const offers = await osoffers.listOffers(slug, offerTokenId, OPENSEA_API_KEY);
+  session.data.offers = offers;
+  if (offers.length === 0) {
+    return bot.sendMessage(chatId, 'No active offers on this token.', {
+      reply_markup: { inline_keyboard: [[{ text: 'Back', callback_data: 'off_back_tokens' }]] },
+    });
+  }
+  const owner = session.data.owned.find((w) => w.ids.includes(offerTokenId) || w.ids.includes(String(offerTokenId)));
+  const lines = offers.slice(0, OF_PAGE).map((o, i) => `${i + 1}. ${o.priceStr} (hash ${o.hash.slice(0, 10)})`);
+  session.step = 'offer_pick';
+  sessionStore.setSession(chatId, session, bot);
+  bot.sendMessage(
+    chatId,
+    `Offers on #${offerTokenId} (${offers.length} active, seller ${shortAddr(owner.wallet.address)}):\n${lines.join('\n')}${offers.length > OF_PAGE ? `\n+${offers.length - OF_PAGE} more...` : ''}`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          ...offers.slice(0, OF_PAGE).map((o, i) => [{ text: `Acc #${i + 1} — ${o.priceStr}`, callback_data: `offacc_${i}` }]),
+          [{ text: 'Back', callback_data: 'off_back_tokens' }],
+        ],
+      },
+    },
+  );
+}
+
+async function acceptOfferAt(chatId, session, i) {
+  const offer = session.data.offers[i];
+  if (!offer) return endAndReturnToMenu(chatId, 'Offer gone, refresh');
+  const owner = session.data.owned.find((w) => w.ids.includes(String(session.data.offerTokenId)));
+  if (!owner) return endAndReturnToMenu(chatId, 'Token not owned anymore');
+  const bearer = await osauth.walletJwt(owner.wallet);
+  const provider = session.data.provider;
+  bot.sendMessage(chatId, `Accepting offer ${offer.priceStr} on #${session.data.offerTokenId} (${shortAddr(owner.wallet.address)})...`);
+  const out = await osoffers.acceptOffer(owner.wallet, offer, session.data.contractAddress, session.data.offerTokenId, bearer, OPENSEA_API_KEY, provider);
+  if (!out.receipt || out.receipt.status !== 1) {
+    return endAndReturnToMenu(chatId, `Accept ${out.receipt ? 'reverted' : 'pending'} — tx ${out.hash}`);
+  }
+  endAndReturnToMenu(chatId, `Offer accepted ✓ ${offer.priceStr}\ntoken #${session.data.offerTokenId}\ntx ${out.hash}\nblock ${out.receipt.blockNumber}`);
+}
+
 // ---- Manage scheduled mints ----
 
 const SCHED_MIN_LABEL = (s) => `${s.collection.split(' ')[0]}-${(s.label || '?').slice(0, 14)}`;
@@ -1180,6 +1291,18 @@ async function handleStep(chatId, session, text) {
       break;
     }
 
+    case 'awaiting_offer_token': {
+      const raw = text.trim().replace(/^#/, '');
+      const all = session.data.owned.flatMap((w) => w.ids.map(String));
+      if (!all.includes(raw)) {
+        bot.sendMessage(chatId, `Token id not held (${all.length} held, e.g. ${all[0]}), try again:`);
+        return;
+      }
+      session.data.offerTokenId = raw;
+      await showTokenOffers(chatId, session);
+      break;
+    }
+
     case 'schedule_manage_qty': {
       const qty = parseInt(text, 10);
       const s = schedules.list().find((x) => x.id === session.data.schdId);
@@ -1508,6 +1631,10 @@ async function handleCallback(chatId, query) {
       session.flow = 'mint';
       return startDetection(chatId, session);
     }
+    if (query.data === 'start_offer') {
+      session.flow = 'offer';
+      return startOfferFlow(chatId, session);
+    }
     if (query.data === 'start_fastlist') {
       session.flow = 'list';
       session.data.fast = true;
@@ -1579,6 +1706,27 @@ async function handleCallback(chatId, query) {
     await bot.answerCallbackQuery(query.id);
     sessionStore.setSession(chatId, { flow: null, step: 'main_menu', data: {} }, bot);
     return showMainMenu(chatId);
+  }
+
+  if (query.data.startsWith('offacc_')) {
+    if (session.step !== 'offer_pick') {
+      return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
+    }
+    await bot.answerCallbackQuery(query.id);
+    const idx = Number(query.data.slice(7));
+    session.step = 'executing';
+    sessionStore.setSession(chatId, session, bot);
+    try {
+      await acceptOfferAt(chatId, session, idx);
+    } catch (err) {
+      endAndReturnToMenu(chatId, `Accept failed: ${err.message.slice(0, 200)}`);
+    }
+    return;
+  }
+
+  if (query.data === 'off_back_tokens') {
+    await bot.answerCallbackQuery(query.id);
+    return renderOfferTokens(chatId, session);
   }
 
   if (query.data === 'schd_qty') {
@@ -1816,6 +1964,7 @@ bot.on('message', async (msg) => {
           { text: 'Manage Listing', callback_data: 'start_manage' },
         ], [
           { text: 'Mint', callback_data: 'start_mint' },
+          { text: 'Acc offer', callback_data: 'start_offer' },
         ]],
       },
     });
