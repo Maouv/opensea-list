@@ -1098,12 +1098,15 @@ async function handleStep(chatId, session, text) {
 
     case 'schedule_bulk_count': {
       const n = parseInt(text, 10);
-      const total = walletAddresses.length;
-      if (!Number.isInteger(n) || n < 1 || n > total) {
-        bot.sendMessage(chatId, `Enter a count between 1 and ${total}:`);
+      const eligReasons = stageReasons(session, session.data.schStage);
+      const eligIdx = eligReasons
+        ? eligReasons.map((r, i) => (r.ok ? i : -1)).filter((i) => i >= 0)
+        : walletAddresses.map((_, i) => i);
+      if (!Number.isInteger(n) || n < 1 || n > eligIdx.length) {
+        bot.sendMessage(chatId, `Only ${eligIdx.length}/${walletAddresses.length} wallet(s) eligible for this stage. Enter 1-${eligIdx.length}:`);
         return;
       }
-      session.data.schSel = walletAddresses.map((_, i) => i).slice(0, n);
+      session.data.schSel = eligIdx.slice(0, n);
       await askSchQty(chatId, session);
       break;
     }
@@ -1500,7 +1503,7 @@ async function handleCallback(chatId, query) {
     await bot.answerCallbackQuery(query.id);
     session.step = 'schedule_bulk_count';
     sessionStore.setSession(chatId, session, bot);
-    return bot.sendMessage(chatId, `How many wallets to mint? (1-${walletAddresses.length}, fills wallets in order)`);
+    return bot.sendMessage(chatId, `How many wallets to mint? (1-${walletAddresses.length}, fills ELIGIBLE wallets in order)`);
   }
 
   if (query.data === 'sch_sep') {
