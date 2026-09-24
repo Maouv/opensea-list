@@ -867,15 +867,21 @@ async function enterScheduleMenu(chatId, session) {
   return enterSchWalletMenu(chatId, session, upcoming[0]);
 }
 
+// reasons per stage: OS matrix, pseudo-all-ok for public, else null
+function stageReasons(session, stage) {
+  const e = (session.data.stageElig || []).find((x) => x.stage.index === stage.index);
+  if (e && e.reasons) return e.reasons;
+  if (e && e.note === 'public, schedulable') return walletAddresses.map((a) => ({ minter: a, ok: true }));
+  return null;
+}
+
 async function enterSchWalletMenu(chatId, session, stage) {
   session.data.schStage = stage;
   session.data.schSel = [];
-  // eligibility first (cached from the stages matrix), balance only as fallback
-  const stageElig = (session.data.stageElig || []).find((e) => e.stage.index === stage.index);
-  const eligReasons = stageElig && stageElig.reasons ? stageElig.reasons.filter((r) => r.ok) : null;
-  const eligCount = eligReasons ? eligReasons.length : null;
+  const eligReasons = stageReasons(session, stage);
+  const eligCount = eligReasons ? eligReasons.filter((r) => r.ok).length : null;
   const eligLine = eligCount != null
-    ? `${eligCount}/${walletAddresses.length} eligible${eligReasons.length ? ' — ' + eligReasons.map((r) => shortAddr(r.minter)).join(', ') : ''}`
+    ? `${eligCount}/${walletAddresses.length} eligible${eligCount ? ' — ' + eligReasons.filter((r) => r.ok).map((r) => shortAddr(r.minter)).join(', ') : ''}`
     : `${walletAddresses.length} wallet ready (balance > 0). Eligibility re-checked at execution.`;
   session.step = 'sch_menu';
   sessionStore.setSession(chatId, session, bot);
@@ -902,8 +908,7 @@ async function enterSchWalletMenu(chatId, session, stage) {
 
 function renderSchElig(chatId, session) {
   const stage = session.data.schStage;
-  const stageElig = (session.data.stageElig || []).find((e) => e.stage.index === stage.index);
-  const reasons = stageElig && stageElig.reasons ? stageElig.reasons : null;
+  const reasons = stageReasons(session, stage);
   const lines = reasons
     ? reasons.map((r, i) => `${i + 1}. ${r.minter}${r.ok ? ' ✓ eligible' : ' ✗'}`).join('\n')
     : walletAddresses.map((a, i) => `${i + 1}. ${a} (eligibility re-checked at execution)`).join('\n');
