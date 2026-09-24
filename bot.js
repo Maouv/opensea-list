@@ -568,6 +568,8 @@ async function resolveMint(chatId, session, chainInput) {
     session.data.drop = drop;
     const active = mint.activeStage(drop);
     if (!active) {
+      const elig = await mint.computeStageEligibility(drop, provider, session.data.contractAddress, walletAddresses, session.data.mintSig);
+      session.data.stageElig = elig;
       const upcomingPublic = drop.stages.some((s) => s.type === 'PUBLIC_SALE' && s.start > Date.now());
       session.step = 'mint_stages';
       sessionStore.setSession(chatId, session, bot);
@@ -576,17 +578,34 @@ async function resolveMint(chatId, session, chainInput) {
         : [[{ text: 'Menu', callback_data: 'menu_home' }]];
       return bot.sendMessage(
         chatId,
-        `${session.data.collection} — drop stages:\n${mint.describeStages(drop)}\n\nNo stage open right now, come back when one starts.`,
+        `${session.data.collection} — drop stages:\n${mint.describeStages(drop, elig)}\n\nNo stage open right now, come back when one starts.`,
         { reply_markup: { inline_keyboard: keyboard } },
       );
     }
     session.data.dropStage = active;
+    const elig = await mint.computeStageEligibility(drop, provider, session.data.contractAddress, walletAddresses, session.data.mintSig);
+    session.data.stageElig = elig;
+    const matrix = `${session.data.collection} — drop stages:\n${mint.describeStages(drop, elig)}`;
+    const activeElig = elig.find((e) => e.stage.index === active.index);
+    const upcomingPublic = drop.stages.some((s) => s.type === 'PUBLIC_SALE' && s.start > Date.now());
+    if (!activeElig || activeElig.count === 0) {
+      session.step = 'mint_stages';
+      sessionStore.setSession(chatId, session, bot);
+      const keyboard = upcomingPublic
+        ? [[{ text: 'Set schedule mint', callback_data: 'menu_sch' }, { text: 'Menu', callback_data: 'menu_home' }]]
+        : [[{ text: 'Menu', callback_data: 'menu_home' }]];
+      const why = active.type !== 'PUBLIC_SALE'
+        ? `\n\nActive stage "${active.label}" is ${active.type} — no wallet can plain-mint it (needs an OpenSea signature). The public stage above can be scheduled.`
+        : '\n\nNo wallet eligible for the active stage.';
+      return bot.sendMessage(chatId, matrix + why, { reply_markup: { inline_keyboard: keyboard } });
+    }
     if (active.priceEth != null) {
       session.data.priceWei = ethers.parseEther(String(active.priceEth));
-      const wlNote = active.type !== 'PUBLIC_SALE' ? `\nNote: active stage is ${active.type} (${active.label}) — wallet must be on its list; the mint simulation decides.` : '';
-      bot.sendMessage(chatId, `${session.data.collection} — drop stages:\n${mint.describeStages(drop)}${wlNote}`);
-      return askMintQty(chatId, session);
+    } else {
+      session.data.priceWei = result.price ?? 0n;
     }
+    bot.sendMessage(chatId, matrix);
+    return askMintQty(chatId, session);
   }
 
   if (!result.active && result.needsPrice) {
@@ -612,15 +631,19 @@ function askMintQty(chatId, session) {
 async function askMintWallets(chatId, session) {
   const balances = await Promise.all(walletAddresses.map((a) => session.data.provider.getBalance(a)));
   let eligible = null;
-  if (session.data.dropStage) {
-    const results = await mint.checkEligibility(
+  const stageElig = session.data.dropStage && session.data.stageElig
+    ? session.data.stageElig.find((x) => x.stage.index === session.data.dropStage.index)
+    : null;
+  if (stageElig && stageElig.reasons) {
+    eligible = stageElig.reasons;
+  } else if (session.data.dropStage) {
+    eligible = await mint.checkEligibility(
       session.data.provider,
       session.data.contractAddress,
       walletAddresses,
       session.data.mintSig,
       session.data.priceWei,
     );
-    eligible = results;
   }
   const lines = walletAddresses.map((a, i) => {
     const bal = Number(ethers.formatEther(balances[i])).toFixed(4);
