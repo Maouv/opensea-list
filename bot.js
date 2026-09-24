@@ -873,7 +873,7 @@ function renderScheduleDetail(chatId, session, s) {
   const total = ethers.parseEther(String(s.priceEth ?? 0)) * BigInt(s.qty) * BigInt(s.wallets.length);
   bot.sendMessage(
     chatId,
-    `${SCHED_MIN_LABEL(s)} (#${s.id})\n${s.collection} — ${s.label}\n${mint.fmtRangeWIB(s.startMs, s.endMs)} WIB\nMint: ${s.wallets.length} wallet × ${s.qty} @ ${s.priceEth} ETH = ${ethers.formatEther(total)} ETH + gas\nWallets: ${s.wallets.map((i) => shortAddr(walletAddresses[i])).join(', ')}\n\nFires in ${mins} minute(s).`,
+    `${SCHED_MIN_LABEL(s)} (#${s.id})\n${s.collection} — ${s.label}\n${mint.fmtRangeWIB(s.startMs, s.endMs)} WIB\nMint: ${s.wallets.length} wallet × ${s.qty} @ ${s.priceEth} ETH = ${ethers.formatEther(total)} ETH + gas\n\nFires in ${mins} minute(s).`,
     {
       reply_markup: {
         inline_keyboard: [
@@ -881,12 +881,29 @@ function renderScheduleDetail(chatId, session, s) {
             { text: '⟳ Refresh', callback_data: `schd_${s.id}` },
             { text: 'Change max mint', callback_data: 'schd_qty' },
           ],
+          [{ text: 'All wallet', callback_data: 'schd_wallets' }],
           [{ text: 'Close', callback_data: 'schd_close' }],
           [{ text: 'Menu', callback_data: 'menu_home' }],
         ],
       },
     },
   );
+}
+
+function renderSchdWallets(chatId, session) {
+  const s = schedules.list().find((x) => x.id === session.data.schdId);
+  if (!s) return endAndReturnToMenu(chatId, 'Schedule already fired/cancelled.');
+  const lines = s.wallets.map((i, k) => `${k + 1}. ${shortAddr(walletAddresses[i])} × ${s.qty}`).join('\n');
+  session.step = 'schedule_manage_detail';
+  sessionStore.setSession(chatId, session, bot);
+  bot.sendMessage(chatId, `${SCHED_MIN_LABEL(s)} — wallets (${s.wallets.length}):\n${lines}`, {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: 'Back', callback_data: `schd_${s.id}` }],
+        [{ text: 'Menu', callback_data: 'menu_home' }],
+      ],
+    },
+  });
 }
 
 function showScheduleList(chatId, session) {
@@ -950,7 +967,7 @@ async function enterSchWalletMenu(chatId, session, stage) {
   const eligReasons = stageReasons(session, stage);
   const eligCount = eligReasons ? eligReasons.filter((r) => r.ok).length : null;
   const eligLine = eligCount != null
-    ? `${eligCount}/${walletAddresses.length} eligible${eligCount ? ' — ' + eligReasons.filter((r) => r.ok).map((r) => shortAddr(r.minter)).join(', ') : ''}`
+    ? `${eligCount}/${walletAddresses.length} eligible${eligCount ? ' — tap [Elig wallet]' : ''}`
     : `${walletAddresses.length} wallet ready (balance > 0). Eligibility re-checked at execution.`;
   session.step = 'sch_menu';
   sessionStore.setSession(chatId, session, bot);
@@ -1069,7 +1086,7 @@ function schConfirm(chatId, session) {
   sessionStore.setSession(chatId, session, bot);
   bot.sendMessage(
     chatId,
-    `--- Schedule Mint ---\n${session.data.collection} — ${stage.label}\n${mint.fmtRangeWIB(stage.start, stage.end)} WIB\nPrice: ${stage.priceEth} ETH × ${qty}/wallet\nWallets (${sel.length}): ${sel.map((i) => shortAddr(walletAddresses[i])).join(', ')}\nTotal: ${ethers.formatEther(total)} ETH + gas\n\nBot fires automatically when the stage opens.`,
+    `--- Schedule Mint ---\n${session.data.collection} — ${stage.label}\n${mint.fmtRangeWIB(stage.start, stage.end)} WIB\nPrice: ${stage.priceEth} ETH × ${qty}/wallet\nWallets: ${sel.length}\nTotal: ${ethers.formatEther(total)} ETH + gas\n\nBot fires automatically when the stage opens.`,
     {
       reply_markup: {
         inline_keyboard: [[
@@ -1576,6 +1593,14 @@ async function handleCallback(chatId, query) {
     session.step = 'schedule_manage_qty';
     sessionStore.setSession(chatId, session, bot);
     return bot.sendMessage(chatId, `How many per wallet? (1-${s.maxPerWallet ?? 100})`);
+  }
+
+  if (query.data === 'schd_wallets') {
+    if (session.step !== 'schedule_manage_detail') {
+      return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
+    }
+    await bot.answerCallbackQuery(query.id);
+    return renderSchdWallets(chatId, session);
   }
 
   if (query.data === 'schd_close') {
