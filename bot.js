@@ -904,6 +904,7 @@ function renderSchdWallets(chatId, session) {
 }
 
 function showScheduleList(chatId, session) {
+  session = session || { flow: 'manage', step: '', data: {} };
   session.flow = 'manage';
   session.data = session.data || {};
   renderScheduleList(chatId, session);
