@@ -5,6 +5,7 @@ const opensea = require('./lib/opensea');
 const holdings = require('./lib/holdings');
 const sessionStore = require('./lib/session');
 const mint = require('./lib/mint');
+const minttx = require('./lib/minttx');
 const schedules = require('./lib/schedules');
 const fs = require('fs');
 const path = require('path');
@@ -22,6 +23,12 @@ try { caMemory = JSON.parse(fs.readFileSync(CA_MEMORY_FILE, 'utf8')); } catch {}
 function rememberCa(entry) {
   caMemory = [entry, ...caMemory.filter((e) => e.address.toLowerCase() !== entry.address.toLowerCase() || e.chain !== entry.chain)].slice(0, CA_MEMORY_LIMIT);
   fs.writeFileSync(CA_MEMORY_FILE, JSON.stringify(caMemory));
+}
+
+// slug for the OS drop-mint builder at execution time (scheduler/mint share it)
+function mintSchedulesSlug(ca, chainInput) {
+  const hit = caMemory.find((e) => e.address.toLowerCase() === ca.toLowerCase() && e.chain === chainInput);
+  return hit ? hit.slug : null;
 }
 
 const SETTINGS_FILE = path.join(__dirname, 'fastlist-settings.json');
@@ -695,14 +702,30 @@ async function goToMintSummary(chatId, session, indexes) {
 
 async function runMint(provider, chainInput, ca, collection, mintSig, mintName, priceWei, qty, indexes, stageLabel, chatId) {
   const iface = new ethers.Interface([`function ${mintSig} payable`]);
-  const value = priceWei * BigInt(qty);
+  const slug = mintSchedulesSlug(ca, chainInput);
   const wallets = indexes.map((i) => new ethers.Wallet(PRIVATE_KEYS[i], provider));
 
   const [network, feeData, blockAtStart] = await Promise.all([provider.getNetwork(), provider.getFeeData(), provider.getBlockNumber()]);
   const probeWallet = wallets[0];
-  const probeContract = new ethers.Contract(ca, iface, provider).connect(probeWallet);
-  const gasLimit = await probeContract[mintName]
-    .estimateGas(...mint.mintArgs(mintSig, probeWallet.address, qty), { value })
+  let probeData;
+  let probeTo = ca;
+  let probeValue = priceWei * BigInt(qty);
+  let gasLimit = null;
+  if (slug && OPENSEA_API_KEY) {
+    const built = await minttx.buildTx(OPENSEA_API_KEY, slug, probeWallet.address, qty);
+    if (built.ok) {
+      probeData = built.data;
+      probeTo = built.to;
+      probeValue = built.value;
+      console.log(`mint route: os-api (slug=${slug})`);
+    } else {
+      throw new Error(`OS mint build: ${built.error}`);
+    }
+  } else {
+    probeData = iface.encodeFunctionData(mintName, mint.mintArgs(mintSig, probeWallet.address, qty));
+  }
+  gasLimit = await provider
+    .estimateGas({ to: probeTo, data: probeData, value: probeValue, from: probeWallet.address })
     .then((g) => (g * 120n) / 100n)
     .catch(() => 600000n);
 
@@ -714,11 +737,25 @@ async function runMint(provider, chainInput, ca, collection, mintSig, mintName, 
         provider.getTransactionCount(wallet.address, 'pending'),
       ]);
       const maxGasCost = gasLimit * (feeData.maxFeePerGas ?? feeData.gasPrice);
-      if (balance < value + maxGasCost) return { ...base, status: 'skipped', error: 'insufficient balance' };
+      const walletValue = priceWei * BigInt(qty);
+      if (balance < walletValue + maxGasCost) return { ...base, status: 'skipped', error: 'insufficient balance' };
+      let txTo = ca;
+      let txData = iface.encodeFunctionData(mintName, mint.mintArgs(mintSig, wallet.address, qty));
+      let txValue = walletValue;
+      if (slug && OPENSEA_API_KEY) {
+        const built = await minttx.buildTx(OPENSEA_API_KEY, slug, wallet.address, qty);
+        if (built.ok) {
+          txTo = built.to;
+          txData = built.data;
+          txValue = built.value;
+        } else {
+          return { ...base, status: 'failed', error: `OS mint: ${built.error.slice(0, 120)}` };
+        }
+      }
       const tx = {
-        to: ca,
-        data: iface.encodeFunctionData(mintName, mint.mintArgs(mintSig, wallet.address, qty)),
-        value,
+        to: txTo,
+        data: txData,
+        value: txValue,
         nonce,
         chainId: network.chainId,
         gasLimit,
@@ -801,18 +838,19 @@ async function executeMint(chatId, session) {
 
 const SCH_PAGE = 5;
 
-function schUpcomingStages(drop) {
+function schUpcomingStages(drop, elig) {
   const now = Date.now();
+  const schedulable = new Set((elig || []).filter((e) => e.count > 0).map((e) => e.stage.index));
   return drop.stages
-    .filter((s) => s.type === 'PUBLIC_SALE' && s.start > now)
+    .filter((s) => s.start > now && (s.type === 'PUBLIC_SALE' || schedulable.has(s.index)))
     .sort((a, b) => a.start - b.start);
 }
 
 async function enterScheduleMenu(chatId, session) {
   const drop = session.data.drop;
-  const upcoming = schUpcomingStages(drop);
+  const upcoming = schUpcomingStages(drop, session.data.stageElig);
   if (upcoming.length === 0) {
-    return endAndReturnToMenu(chatId, 'No upcoming PUBLIC stage to schedule (WL/signed stages need an OpenSea signature, not supported).');
+    return endAndReturnToMenu(chatId, 'No upcoming stage with an eligible wallet to schedule.');
   }
   if (upcoming.length > 1) {
     session.step = 'sch_stage_pick';
@@ -951,6 +989,7 @@ async function fireSchedule(s) {
   schedules.mark(s.id, 'fired');
   const provider = providers[s.chain];
   if (!provider) return bot.sendMessage(s.chatId, `Auto-mint ${s.collection}: no RPC for ${s.chain}, aborting`);
+  // price sanity: stage price at fire time (OS build also validates balance server-side)
   let priceWei = ethers.parseEther(String(s.priceEth));
   try {
     const drop = await mint.fetchDrop(s.slug);
