@@ -1626,7 +1626,7 @@ async function handleCallback(chatId, query) {
     return promptContract(chatId, session);
   }
 
-  if (query.data === 'start_list' || query.data === 'start_manage' || query.data === 'start_mint') {
+  if (query.data === 'start_list' || query.data === 'start_manage' || query.data === 'start_mint' || query.data === 'start_offer') {
     if (session.step !== 'awaiting_start_mode') {
       return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
     }
