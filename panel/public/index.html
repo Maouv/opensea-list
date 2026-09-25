@@ -1,0 +1,428 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>seasore panel</title>
+<style>
+:root{
+  --bg:#0a0a0a; --panel:#141414; --line:#2a2a2a; --txt:#e8e8e8; --dim:#888;
+  --inv:#e8e8e8; --invtxt:#0a0a0a; --ok:#4ade4a; --err:#ff5555;
+}
+*{box-sizing:border-box; -webkit-tap-highlight-color:transparent}
+body{margin:0; background:var(--bg); color:var(--txt); font:14px/1.45 ui-monospace,Menlo,Consolas,monospace; padding:10px; padding-bottom:76px}
+h1{font-size:15px; margin:4px 0 12px; letter-spacing:1px}
+h2{font-size:12px; color:var(--dim); margin:18px 0 6px; text-transform:uppercase; letter-spacing:1px}
+button, .btn{
+  font:inherit; color:var(--txt); background:var(--panel); border:1px solid var(--line);
+  border-radius:8px; padding:10px 14px; min-height:44px; cursor:pointer; width:100%; text-align:center;
+}
+button:active{background:#1e1e1e}
+button.primary{background:var(--inv); color:var(--invtxt); border-color:var(--inv); font-weight:700}
+button:disabled{opacity:.4; cursor:default}
+.row{display:flex; gap:8px; margin:8px 0}
+.row>*{flex:1}
+.card{background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px; margin:8px 0}
+.small{font-size:12px; color:var(--dim)}
+.mono{word-break:break-all}
+input,select{
+  font:inherit; width:100%; background:#0f0f0f; border:1px solid var(--line); color:var(--txt);
+  border-radius:8px; padding:10px; min-height:44px;
+}
+input:focus{outline:none; border-color:var(--txt)}
+table{width:100%; border-collapse:collapse; font-size:12px}
+td,th{padding:5px 6px; border-bottom:1px solid var(--line); text-align:left}
+th{color:var(--dim); font-weight:400}
+.ok{color:var(--ok)} .err{color:var(--err)} .dim{color:var(--dim)}
+.chk{display:flex; align-items:center; gap:10px; padding:10px 0; border-bottom:1px solid var(--line); cursor:pointer}
+.chk input{display:none}
+.box{width:22px; height:22px; border:1px solid var(--line); border-radius:6px; flex:none; display:flex; align-items:center; justify-content:center; font-weight:700}
+.chk input:checked+.box{background:var(--inv); color:var(--invtxt); border-color:var(--inv)}
+#toast{position:fixed; left:10px; right:10px; bottom:64px; background:var(--inv); color:var(--invtxt); padding:12px; border-radius:10px; display:none; z-index:9}
+#log{background:#050505; border:1px solid var(--line); border-radius:8px; padding:8px; font-size:11px; max-height:180px; overflow:auto; white-space:pre-wrap; color:#9f9}
+#nav{position:fixed; bottom:0; left:0; right:0; display:flex; background:var(--bg); border-top:1px solid var(--line); z-index:8}
+#nav button{border:none; border-radius:0; min-height:52px; border-right:1px solid var(--line)}
+#nav button.on{background:var(--inv); color:var(--invtxt)}
+.page{display:none} .page.on{display:block}
+.tag{display:inline-block; border:1px solid var(--line); border-radius:5px; padding:1px 6px; font-size:11px; margin-left:4px}
+a{color:var(--txt)}
+</style>
+</head>
+<body>
+
+<div id="auth" class="page on">
+  <h1>seasore</h1>
+  <div class="card">
+    <div class="small" style="margin-bottom:8px">Panel token</div>
+    <input id="tokin" type="password" placeholder="PANEL_TOKEN">
+    <div class="row"><button class="primary" onclick="doAuth()">Unlock</button></div>
+  </div>
+</div>
+
+<div id="app">
+  <h1>seasore <span class="small" id="netTag"></span></h1>
+
+  <div id="pg-home" class="page on">
+    <h2>wallets</h2>
+    <div class="card"><table id="wlt"><tr><th>#</th><th>wallet</th><th>eth</th></tr></table></div>
+    <h2>quick actions</h2>
+    <div class="row">
+      <button onclick="go('list')">List</button>
+      <button onclick="go('manage')">Manage</button>
+    </div>
+    <div class="row">
+      <button onclick="go('mint')">Mint</button>
+      <button onclick="go('offer')">Acc offer</button>
+    </div>
+    <div class="row">
+      <button onclick="go('sched')">Schedules</button>
+      <button onclick="go('settings')">Settings</button>
+    </div>
+  </div>
+
+  <div id="pg-list" class="page">
+    <h2>list NFTs</h2>
+    <div class="card">
+      <input id="list-ca" placeholder="contract address 0x...">
+      <div class="row"><button onclick="listDetect()">Detect</button></div>
+      <div id="list-chain" class="small"></div>
+    </div>
+    <div id="list-body"></div>
+    <div class="row"><button onclick="go('home')">Back</button></div>
+  </div>
+
+  <div id="pg-manage" class="page">
+    <h2>manage listing</h2>
+    <div class="card">
+      <input id="mg-ca" placeholder="contract address 0x...">
+      <div class="row"><button onclick="mgDetect()">Detect</button></div>
+      <div id="mg-chain" class="small"></div>
+    </div>
+    <div id="mg-body"></div>
+    <div class="row"><button onclick="go('home')">Back</button></div>
+  </div>
+
+  <div id="pg-mint" class="page">
+    <h2>mint</h2>
+    <div class="card">
+      <input id="mint-ca" placeholder="contract address 0x...">
+      <div class="row"><button onclick="mintDetect()">Detect</button></div>
+      <div id="mint-chain" class="small"></div>
+    </div>
+    <div id="mint-body"></div>
+    <div class="row"><button onclick="go('home')">Back</button></div>
+  </div>
+
+  <div id="pg-offer" class="page">
+    <h2>accept offer</h2>
+    <div class="card">
+      <input id="off-ca" placeholder="contract address 0x...">
+      <div class="row"><button onclick="offDetect()">Detect</button></div>
+      <div id="off-chain" class="small"></div>
+    </div>
+    <div id="off-body"></div>
+    <div class="row"><button onclick="go('home')">Back</button></div>
+  </div>
+
+  <div id="pg-sched" class="page">
+    <h2>scheduled mints</h2>
+    <div id="sched-body"></div>
+    <div class="row"><button onclick="loadSched()">⟳ Refresh</button><button onclick="go('home')">Back</button></div>
+  </div>
+
+  <div id="pg-settings" class="page">
+    <h2>fast list settings</h2>
+    <div class="card">
+      <div class="small">price (number or % like <span class="mono">-40%</span>)</div>
+      <input id="set-price">
+      <div class="chk" onclick="setConfirm()">
+        <input id="set-confirm" type="checkbox"><span class="box" id="set-box"></span>
+        <span>ask confirmation before listing</span>
+      </div>
+      <div id="set-wallets"></div>
+      <div class="row"><button class="primary" onclick="saveSettings()">Save</button></div>
+    </div>
+    <div class="row"><button onclick="go('home')">Back</button></div>
+  </div>
+
+  <div id="pg-job" class="page">
+    <h2 id="job-title">job</h2>
+    <div class="card">
+      <div class="small" id="job-status"></div>
+      <div style="height:6px;background:#222;border-radius:3px;margin:8px 0"><div id="job-bar" style="height:6px;background:var(--inv);border-radius:3px;width:0%"></div></div>
+      <div id="log"></div>
+    </div>
+    <div class="row"><button class="primary" onclick="go('home')">Done</button></div>
+  </div>
+</div>
+
+<div id="toast"></div>
+<nav id="nav">
+  <button data-pg="home" class="on">Home</button>
+  <button data-pg="list">List</button>
+  <button data-pg="mint">Mint</button>
+  <button data-pg="offer">Offer</button>
+  <button data-pg="sched">Sched</button>
+  <button data-pg="settings">⚙</button>
+</nav>
+
+<script>
+const $=(id)=>document.getElementById(id);
+let TOKEN=sessionStorage.getItem('panel_token')||'';
+let S={};
+const B={' ':'\u00a0'};
+function toast(msg){const t=$('toast'); t.textContent=msg; t.style.display='block'; setTimeout(()=>t.style.display='none',2600);}
+function esc(s){return String(s??'').replace(/[&<>"']/g,(c)=>({'&':'&','<':'<','>':'>','"':'"',"'":'&#39;'}[c]));}
+function go(pg){document.querySelectorAll('.page').forEach(p=>p.classList.remove('on')); const el=$('pg-'+pg); if(el)el.classList.add('on');
+  document.querySelectorAll('#nav button').forEach(b=>b.classList.toggle('on',b.dataset.pg===pg));
+  if(pg==='home')loadStatus(); if(pg==='sched')loadSched(); if(pg==='settings')loadSettings(); if(pg==='job'){}}
+document.querySelectorAll('#nav button').forEach(b=>b.onclick=()=>go(b.dataset.pg));
+async function api(path,opt={}){
+  const r=await fetch(path,{...opt,headers:{'content-type':'application/json',authorization:'Bearer '+TOKEN}});
+  if(r.status===401){sessionStorage.removeItem('panel_token'); TOKEN=''; $('app').style.display='none'; $('auth').style.display='block'; throw new Error('unauthorized');}
+  const j=await r.json(); if(!r.ok)throw new Error(j.error||r.status); return j;
+}
+function short(a){return a?a.slice(0,7)+'...'+a.slice(-5):'';}
+
+async function doAuth(){TOKEN=$('tokin').value.trim(); try{await api('/api/status'); sessionStorage.setItem('panel_token',TOKEN); boot();}catch(e){toast('wrong token');}}
+async function loadStatus(){
+  S=await api('/api/status');
+  $('netTag').textContent='· '+S.chains.join(' ');
+  const t=$('wlt'); t.innerHTML='<tr><th>#</th><th>wallet</th><th>eth</th></tr>';
+  S.wallets.forEach((w,i)=>{t.innerHTML+=`<tr><td>${i+1}</td><td class="mono">${short(w)}</td><td>${S.balances[i].toFixed(4)}</td></tr>`;});
+}
+function boot(){$('auth').style.display='none'; $('app').style.display='block'; go('home');}
+if(TOKEN){api('/api/status').then(boot).catch(()=>{});}
+
+// ---------- LIST ----------
+let LD=null;
+async function listDetect(){
+  const ca=$('list-ca').value.trim();
+  try{
+    const d=await api('/api/detect',{method:'POST',body:JSON.stringify({ca})});
+    const chains=d.holdings.filter(([,n])=>n>0);
+    $('list-chain').innerHTML=chains.length?chains.map(([c,n])=>`${c} (${n})`).join(' · '):'no holdings, mint chains: '+(d.codeOn.join(', ')||'none');
+    if(chains.length===1)return listPrepare(ca,chains[0][0]);
+    if(chains.length>1){$('list-chain').innerHTML=chains.map(([c,n])=>`<button onclick="listPrepare('${ca}','${c}')">${c} (${n})</button>`).join(' ');}
+  }catch(e){toast(e.message);}
+}
+async function listPrepare(ca,chain){
+  try{
+    LD=await api('/api/list/prepare',{method:'POST',body:JSON.stringify({ca,chain})});
+    const b=$('list-body');
+    b.innerHTML=`<div class="card">slug: <b>${LD.slug}</b> · floor: <b>${LD.floorPrice}</b><div id="lw"></div>
+      <div class="small" style="margin-top:8px">price per NFT</div><input id="list-price" placeholder="number or % like -40%">
+      <div class="row"><button class="primary" onclick="listGo()">List all</button></div></div>`;
+    const w=$('lw');
+    LD.walletsData.forEach((wd,i)=>{
+      const on=wd.items.length>0 && S.fastSettings.wallets[wd.address]!==false;
+      w.innerHTML+=`<div class="chk" onclick="lwToggle(${i})"><input type="checkbox" id="lw${i}" ${on?'checked':''}><span class="box"></span><span>#${i+1} ${short(wd.address)} — ${wd.items.length} NFT${wd.listed.length?` · ${wd.listed.length} listed`:''}</span></div>`;
+    });
+  }catch(e){toast(e.message);}
+}
+function lwToggle(i){const c=$('lw'+i); c.checked=!c.checked;}
+async function listGo(){
+  try{
+    const picks=[]; LD.walletsData.forEach((wd,i)=>{if($('lw'+i)&&$('lw'+i).checked)picks.push({index:i,address:wd.address,items:wd.items});});
+    if(!picks.length)return toast('pick at least one wallet');
+    const price=openseaRound($('list-price').value.trim(),LD.floorPrice,LD.chainInput);
+    const cfg={ca:LD.ca,chainInput:LD.chainInput,chain:LD.chain,slug:LD.slug,floorPrice:LD.floorPrice,
+      selections:picks.map(p=>({walletIndex:p.index,price,items:p.items}))};
+    const r=await api('/api/action',{method:'POST',body:JSON.stringify({kind:'list',label:'list '+LD.slug,total:picks.reduce((s,p)=>s+p.items.length,0),cfg})});
+    openJob(r.jobId,'listing '+LD.slug);
+  }catch(e){toast(e.message);}
+}
+function openseaRound(v,floor,chain){
+  if(!v)return null;
+  if(v.endsWith('%')){const p=parseFloat(v); if(!Number.isFinite(p))return null; return +(floor*(1+p/100)).toFixed(chain==='base'?4:6);}
+  const n=parseFloat(v); return Number.isFinite(n)&&n>0?n:null;
+}
+
+// ---------- MANAGE ----------
+let MD=null;
+async function mgDetect(){
+  const ca=$('mg-ca').value.trim();
+  try{
+    const d=await api('/api/detect',{method:'POST',body:JSON.stringify({ca})});
+    const chains=d.holdings.filter(([,n])=>n>0);
+    $('mg-chain').innerHTML=chains.length?chains.map(([c,n])=>`<button onclick="mgPrepare('${ca}','${c}')">${c} (${n})</button>`).join(' '):'no holdings';
+  }catch(e){toast(e.message);}
+}
+async function mgPrepare(ca,chain){
+  try{
+    MD=await api('/api/list/prepare',{method:'POST',body:JSON.stringify({ca,chain})});
+    const b=$('mg-body'); b.innerHTML='';
+    MD.walletsData.forEach((wd,i)=>{
+      if(!wd.listed.length)return;
+      b.innerHTML+=`<div class="card">#${i+1} ${short(wd.address)} — listed: ${wd.listed.join(', ')}
+        <div class="row"><button onclick="mgGo(${i},'close')">Close</button><button onclick="mgGo(${i},'reprice')">Reprice</button></div>
+        <input id="mgp${i}" placeholder="new price (reprice only)"></div>`;
+    });
+    if(!b.innerHTML)b.innerHTML='<div class="card dim">no active listings</div>';
+  }catch(e){toast(e.message);}
+}
+async function mgGo(wi,mode){
+  try{
+    const wd=MD.walletsData[wi];
+    const ids=wd.listed;
+    const price=mode==='reprice'?openseaRound($('mgp'+wi).value.trim(),MD.floorPrice,MD.chainInput):null;
+    if(mode==='reprice'&&!price)return toast('need price');
+    const cfg={ca:MD.ca,chainInput:MD.chainInput,chain:MD.chain,slug:MD.slug,walletIndex:wi,tokenIds:ids,mode,price};
+    const r=await api('/api/action',{method:'POST',body:JSON.stringify({kind:'manage',label:mode+' '+ids.length+' token(s)',total:ids.length,cfg})});
+    openJob(r.jobId,mode+' '+MD.slug);
+  }catch(e){toast(e.message);}
+}
+
+// ---------- MINT ----------
+let MDINT=null;
+async function mintDetect(){
+  const ca=$('mint-ca').value.trim();
+  try{
+    const d=await api('/api/detect',{method:'POST',body:JSON.stringify({ca})});
+    $('mint-chain').innerHTML=d.codeOn.length?d.codeOn.map(c=>`<button onclick="mintLoad('${ca}','${c}')">${c}</button>`).join(' '):'contract not found on any configured chain';
+  }catch(e){toast(e.message);}
+}
+async function mintLoad(ca,chain){
+  // reuse list/prepare for slug, then fetch drop via same slugs as bot
+  try{
+    MDINT=await api('/api/mint/prepare',{method:'POST',body:JSON.stringify({ca,chain})});
+    const b=$('mint-body'); b.innerHTML='';
+    if(MDINT.error)return $('mint-chain').innerHTML='<span class="err">'+MDINT.error+'</span>';
+    const D=MDINT;
+    b.innerHTML=`<div class="card"><b>${D.collection||short(ca)}</b> · supply ${D.supply||'?'}<div class="small" style="margin-top:6px">stages</div>
+      ${(D.stages||[]).map(s=>`<div style="padding:4px 0;border-bottom:1px solid var(--line)">${s.index}. ${s.label} [${s.type==='PUBLIC_SALE'?'public':'signed'}] — ${s.priceEth} ETH, max ${s.maxPerWallet??'?'}<br><span class="small">${new Date(s.start).toLocaleString()} → ${new Date(s.end).toLocaleTimeString()}</span></div>`).join('')}
+      <div class="small" style="margin:8px 0 4px">qty per wallet</div><input id="mint-qty" value="1">
+      <div class="row"><button class="primary" onclick="mintGo()">Mint now</button></div>
+      <div class="small" style="margin:6px 0 2px">schedule (UTC ISO, e.g. ${new Date(Date.now()+36e5).toISOString().slice(0,16)})</div>
+      <input id="mint-when"><div class="row"><button onclick="mintSched()">Schedule</button></div>
+      <div id="mint-elig" class="small" style="margin-top:6px"></div></div>`;
+  }catch(e){toast(e.message);}
+}
+async function mintGo(){
+  try{
+    const qty=parseInt($('mint-qty').value,10)||1;
+    const st=(MDINT.stages||[]).find(s=>Date.now()>=s.start&&Date.now()<=s.end)||(MDINT.stages||[]).find(s=>s.type==='PUBLIC_SALE');
+    const cfg={chainInput:MDINT.chainInput,ca:MDINT.ca,collection:MDINT.collection,mintSig:MDINT.mintSig,mintName:MDINT.mintName,
+      priceEth:st?st.priceEth:MDINT.priceEth,qty,indexes:MDINT.wallets.map((w,i)=>i),stageLabel:st?st.label:null};
+    const r=await api('/api/action',{method:'POST',body:JSON.stringify({kind:'mint',label:'mint '+(MDINT.collection||''),total:MDINT.wallets.length,cfg})});
+    openJob(r.jobId,'minting');
+  }catch(e){toast(e.message);}
+}
+async function mintSched(){
+  try{
+    const qty=parseInt($('mint-qty').value,10)||1;
+    const when=$('mint-when').value.trim();
+    if(!when)return toast('need time');
+    const st=(MDINT.stages||[]).find(s=>s.type==='PUBLIC_SALE');
+    const r=await api('/api/schedule',{method:'POST',body:JSON.stringify({ca:MDINT.ca,chain:MDINT.chainInput,slug:MDINT.slug,collection:MDINT.collection,
+      stageIndex:st?st.index:0,label:st?st.label:'public',priceEth:st?st.priceEth:0,qty,when})});
+    toast('scheduled ✓ #'+r.id); loadSched&&0; go('sched');
+  }catch(e){toast(e.message);}
+}
+
+// ---------- OFFER ----------
+let OD=null;
+async function offDetect(){
+  const ca=$('off-ca').value.trim();
+  try{
+    const d=await api('/api/detect',{method:'POST',body:JSON.stringify({ca})});
+    const chains=d.holdings.filter(([,n])=>n>0);
+    $('off-chain').innerHTML=chains.length?chains.map(([c,n])=>`<button onclick="offPrepare('${ca}','${c}')">${c} (${n})</button>`).join(' '):'no holdings';
+  }catch(e){toast(e.message);}
+}
+async function offPrepare(ca,chain){
+  try{
+    OD=await api('/api/list/prepare',{method:'POST',body:JSON.stringify({ca,chain})});
+    const b=$('off-body');
+    b.innerHTML=`<div class="card">slug: <b>${OD.slug}</b><div class="small" style="margin:6px 0 4px">token id</div><input id="off-token" placeholder="e.g. 148877">
+      <div class="row"><button class="primary" onclick="offLoad()">Load offers</button></div></div>`;
+  }catch(e){toast(e.message);}
+}
+async function offLoad(){
+  try{
+    const tokenId=$('off-token').value.trim();
+    const d=await api('/api/offers',{method:'POST',body:JSON.stringify({slug:OD.slug,tokenId,chain:OD.chainInput,ca:OD.ca})});
+    const b=$('off-body');
+    b.innerHTML=`<div class="card"><div class="small">${d.offers.length} offer(s) on #${tokenId}</div>
+      ${d.offers.map(o=>`<div style="padding:6px 0;border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center">
+        <span style="flex:1">${o.priceStr}${o.fundable?'':' <span class="err">⚠ air</span>'}</span>
+        <button style="width:auto;min-height:36px;padding:6px 12px" ${o.fundable?'':'disabled'} onclick="offAcc(${o.i})">Acc</button></div>`).join('')}</div>`;
+    OD.tokenId=tokenId; OD.offers=d.offers; OD.walletIndex=d.walletIndex;
+  }catch(e){toast(e.message);}
+}
+async function offAcc(i){
+  try{
+    const o=OD.offers[i];
+    const cfg={chainInput:OD.chainInput,ca:OD.ca,tokenId:OD.tokenId,walletIndex:OD.walletIndex,offerIndex:i,slug:OD.slug};
+    const r=await api('/api/action',{method:'POST',body:JSON.stringify({kind:'accept',label:'accept '+o.priceStr,cfg})});
+    openJob(r.jobId,'accept offer');
+  }catch(e){toast(e.message);}
+}
+
+// ---------- SCHEDULES ----------
+async function loadSched(){
+  try{
+    const all=await api('/api/schedules');
+    const b=$('sched-body');
+    b.innerHTML=all.length?all.map(s=>{
+      const mins=Math.round((s.startMs-Date.now())/6e4);
+      return `<div class="card"><b>${s.collection}</b> — ${s.label} <span class="tag">${s.status}</span>
+        <div class="small">${new Date(s.startMs).toLocaleString()} · ${s.wallets.length}w × ${s.qty} @ ${s.priceEth} ETH · #${s.id}</div>
+        <div class="small">${mins>0?'fires in '+(mins<60?mins+'m':Math.round(mins/60)+'h'):'open now'}</div>
+        <div class="row"><button onclick="schQty('${s.id}')">Change qty</button><button onclick="schCancel('${s.id}')" style="color:var(--err)">Cancel</button></div></div>`;
+    }).join(''):'<div class="card dim">none — schedule from Mint page</div>';
+  }catch(e){toast(e.message);}
+}
+async function schQty(id){
+  const q=window.prompt('new qty per wallet'); if(!q)return;
+  try{await api('/api/schedules/qty',{method:'POST',body:JSON.stringify({id,qty:q})}); loadSched();}catch(e){toast(e.message);}
+}
+async function schCancel(id){
+  const ok=window.confirm('cancel '+id+'?'); if(!ok)return;
+  try{await api('/api/schedules/cancel',{method:'POST',body:JSON.stringify({id})}); loadSched();}catch(e){toast(e.message);}
+}
+
+// ---------- SETTINGS ----------
+async function loadSettings(){
+  try{S=await api('/api/status');
+    $('set-price').value=S.fastSettings.price;
+    $('set-confirm').checked=S.fastSettings.confirm!==false; $('set-box').textContent=$('set-confirm').checked?'✓':'';
+    const w=$('set-wallets'); w.innerHTML='';
+    S.wallets.forEach((a,i)=>{
+      const on=S.fastSettings.wallets[a]!==false;
+      w.innerHTML+=`<div class="chk" onclick="swToggle(${i})"><input type="checkbox" id="sw${i}" ${on?'checked':''}><span class="box"></span><span class="mono">#${i+1} ${short(a)}</span></div>`;
+    });
+  }catch(e){toast(e.message);}
+}
+function swToggle(i){const c=$('sw'+i); c.checked=!c.checked;}
+function setConfirm(){const c=$('set-confirm'); c.checked=!c.checked; $('set-box').textContent=c.checked?'✓':'';}
+async function saveSettings(){
+  try{
+    const wallets={}; S.wallets.forEach((a,i)=>{const c=$('sw'+i); if(c)wallets[a]=c.checked;});
+    await api('/api/settings',{method:'POST',body:JSON.stringify({price:$('set-price').value,confirm:$('set-confirm').checked,wallets})});
+    toast('saved ✓'); go('home');
+  }catch(e){toast(e.message);}
+}
+
+// ---------- JOB ----------
+let JOB=null, JOB_TIMER=null;
+function openJob(id,title){
+  JOB=id; $('job-title').textContent=title; go('job');
+  pollJob();
+  if(JOB_TIMER)clearInterval(JOB_TIMER);
+  JOB_TIMER=setInterval(pollJob,1200);
+}
+async function pollJob(){
+  if(!JOB)return;
+  try{
+    const j=await api('/api/jobs/'+JOB);
+    $('job-status').innerHTML=`${j.status} · ${j.done}/${j.total||j.results.length}`;
+    $('job-bar').style.width=j.total?`${Math.round(100*j.done/j.total)}%`:(j.status!=='running'?'100%':'50%');
+    $('log').textContent=(j.log||[]).join('\n');
+    $('log').scrollTop=1e9;
+    if(j.status!=='running'){clearInterval(JOB_TIMER); JOB_TIMER=null;}
+  }catch(e){}
+}
+</script>
+</body>
+</html>

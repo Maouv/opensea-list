@@ -2,6 +2,7 @@ require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const opensea = require('./lib/opensea');
+const state = require('./lib/state');
 const holdings = require('./lib/holdings');
 const sessionStore = require('./lib/session');
 const mint = require('./lib/mint');
@@ -15,56 +16,14 @@ const path = require('path');
 function shortAddr(address) {
   return `${address.slice(0, 7)}...${address.slice(-5)}`;
 }
+const { OPENSEA_API_KEY, TELEGRAM_TOKEN, AUTHORIZED_USER_ID, PRIVATE_KEYS, providers, walletAddresses, walletWallets, fastSettings, saveFastSettings, caMemory, rememberCa, mintSchedulesSlug } = state;
 
 const CA_REGEX = /^0x[0-9a-fA-F]{40}$/;
 
-const CA_MEMORY_FILE = path.join(__dirname, 'ca-memory.json');
-const CA_MEMORY_LIMIT = 3;
-let caMemory = [];
-try { caMemory = JSON.parse(fs.readFileSync(CA_MEMORY_FILE, 'utf8')); } catch {}
-function rememberCa(entry) {
-  caMemory = [entry, ...caMemory.filter((e) => e.address.toLowerCase() !== entry.address.toLowerCase() || e.chain !== entry.chain)].slice(0, CA_MEMORY_LIMIT);
-  fs.writeFileSync(CA_MEMORY_FILE, JSON.stringify(caMemory));
-}
-
-// slug for the OS drop-mint builder at execution time (scheduler/mint share it)
-function mintSchedulesSlug(ca, chainInput) {
-  const hit = caMemory.find((e) => e.address.toLowerCase() === ca.toLowerCase() && e.chain === chainInput);
-  return hit ? hit.slug : null;
-}
-
-const SETTINGS_FILE = path.join(__dirname, 'fastlist-settings.json');
-let fastSettings = { price: '-40%', confirm: true, wallets: {} };
-try {
-  const loaded = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
-  if (loaded && typeof loaded === 'object') fastSettings = { ...fastSettings, ...loaded };
-} catch {}
-function saveFastSettings() {
-  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(fastSettings));
-}
-
-const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const AUTHORIZED_USER_ID = process.env.TELEGRAM_USER_ID;
-const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY;
-const PRIVATE_KEYS = process.env.PRIVATE_KEYS.split(',').map((k) => k.trim());
 const CONCURRENCY = Math.max(1, parseInt(process.env.LIST_CONCURRENCY, 10) || 3);
 const LISTING_DURATION_DAYS = 7;
 
-const RPC_URLS = {
-  ethereum: process.env.RPC_URL_ETHEREUM,
-  polygon: process.env.RPC_URL_POLYGON,
-  base: process.env.RPC_URL_BASE,
-  arc: process.env.RPC_URL_ARC,
-  robinhood: process.env.RPC_URL_ROBINHOOD,
-};
-
-const providers = Object.fromEntries(
-  Object.entries(RPC_URLS)
-    .filter(([, url]) => url)
-    .map(([name, url]) => [name, new ethers.JsonRpcProvider(url)]),
-);
-const walletAddresses = PRIVATE_KEYS.map((pk) => new ethers.Wallet(pk).address);
-const walletWallets = PRIVATE_KEYS.map((pk) => { const w = new ethers.Wallet(pk); return { wallet: w, address: w.address }; });
+require('./panel/server'); // web panel — same process, shares lib/state
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
