@@ -903,7 +903,7 @@ function renderOfferTokens(chatId, session) {
 
 async function showTokenOffers(chatId, session) {
   const { chainInput, slug, offerTokenId } = session.data;
-  const offers = await osoffers.listOffers(slug, offerTokenId, OPENSEA_API_KEY);
+  const offers = await osoffers.listOffersWithOrders(slug, offerTokenId, OPENSEA_API_KEY, session.data.provider);
   session.data.offers = offers;
   if (offers.length === 0) {
     return bot.sendMessage(chatId, 'No active offers on this token.', {
@@ -911,16 +911,20 @@ async function showTokenOffers(chatId, session) {
     });
   }
   const owner = session.data.owned.find((w) => w.ids.includes(offerTokenId) || w.ids.includes(String(offerTokenId)));
-  const lines = offers.slice(0, OF_PAGE).map((o, i) => `${i + 1}. ${o.priceStr} (hash ${o.hash.slice(0, 10)})`);
+  const fundable = offers.filter((o) => o.fundable !== false);
+  if (fundable.length === 0) {
+    return endAndReturnToMenu(chatId, `All ${offers.length} offer(s) are unfundable (offerer hasn't approved the currency — spam offers). Not accepting.`);
+  }
+  const lines = fundable.slice(0, OF_PAGE).map((o, i) => `${i + 1}. ${o.priceStr}${o.fundable === null ? ' (unverified)' : ''}`);
   session.step = 'offer_pick';
   sessionStore.setSession(chatId, session, bot);
   bot.sendMessage(
     chatId,
-    `Offers on #${offerTokenId} (${offers.length} active, seller ${shortAddr(owner.wallet.address)}):\n${lines.join('\n')}${offers.length > OF_PAGE ? `\n+${offers.length - OF_PAGE} more...` : ''}`,
+    `Offers on #${offerTokenId} (${fundable.length} accept-able of ${offers.length} total, seller ${shortAddr(owner.wallet.address)}):\n${lines.join('\n')}${fundable.length > OF_PAGE ? `\n+${fundable.length - OF_PAGE} more...` : ''}`,
     {
       reply_markup: {
         inline_keyboard: [
-          ...offers.slice(0, OF_PAGE).map((o, i) => [{ text: `Acc #${i + 1} — ${o.priceStr}`, callback_data: `offacc_${i}` }]),
+          ...fundable.slice(0, OF_PAGE).map((o, i) => [{ text: `Acc #${i + 1} — ${o.priceStr}`, callback_data: `offacc_${i}` }]),
           [{ text: 'Back', callback_data: 'off_back_tokens' }],
         ],
       },
