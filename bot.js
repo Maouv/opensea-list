@@ -933,6 +933,9 @@ async function acceptOfferAt(chatId, session, i) {
   if (!offer) return endAndReturnToMenu(chatId, 'Offer gone, refresh');
   const owner = session.data.owned.find((w) => w.ids.includes(String(session.data.offerTokenId)));
   if (!owner) return endAndReturnToMenu(chatId, 'Token not owned anymore');
+  if (!(await opensea.checkStillOwned(session.data.contractAddress, session.data.offerTokenId, owner.wallet.address, session.data.provider))) {
+    return endAndReturnToMenu(chatId, 'Token not owned anymore (on-chain re-check)');
+  }
   const bearer = await osauth.walletJwt(owner.wallet);
   const provider = session.data.provider;
   bot.sendMessage(chatId, `Accepting offer ${offer.priceStr} on #${session.data.offerTokenId} (${shortAddr(owner.wallet.address)})...`);
