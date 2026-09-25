@@ -911,20 +911,16 @@ async function showTokenOffers(chatId, session) {
     });
   }
   const owner = session.data.owned.find((w) => w.ids.includes(offerTokenId) || w.ids.includes(String(offerTokenId)));
-  const fundable = offers.filter((o) => o.fundable !== false);
-  if (fundable.length === 0) {
-    return endAndReturnToMenu(chatId, `All ${offers.length} offer(s) are unfundable (offerer hasn't approved the currency — spam offers). Not accepting.`);
-  }
-  const lines = fundable.slice(0, OF_PAGE).map((o, i) => `${i + 1}. ${o.priceStr}${o.fundable === null ? ' (unverified)' : ''}`);
+  const lines = offers.slice(0, OF_PAGE).map((o, i) => `${i + 1}. ${o.priceStr}${o.fundable === false ? ' ⚠ no allowance' : ''}`);
   session.step = 'offer_pick';
   sessionStore.setSession(chatId, session, bot);
   bot.sendMessage(
     chatId,
-    `Offers on #${offerTokenId} (${fundable.length} accept-able of ${offers.length} total, seller ${shortAddr(owner.wallet.address)}):\n${lines.join('\n')}${fundable.length > OF_PAGE ? `\n+${fundable.length - OF_PAGE} more...` : ''}`,
+    `Offers on #${offerTokenId} (${offers.length} active, seller ${shortAddr(owner.wallet.address)}):\n${lines.join('\n')}${offers.length > OF_PAGE ? `\n+${offers.length - OF_PAGE} more...` : ''}`,
     {
       reply_markup: {
         inline_keyboard: [
-          ...fundable.slice(0, OF_PAGE).map((o, i) => [{ text: `Acc #${i + 1} — ${o.priceStr}`, callback_data: `offacc_${i}` }]),
+          ...offers.slice(0, OF_PAGE).map((o, i) => [{ text: `Acc #${i + 1} — ${o.priceStr.split(' (')[0]}`, callback_data: `offacc_${i}` }]),
           [{ text: 'Back', callback_data: 'off_back_tokens' }],
         ],
       },
