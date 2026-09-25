@@ -938,6 +938,11 @@ async function acceptOfferAt(chatId, session, i) {
   }
   const bearer = await osauth.walletJwt(owner.wallet);
   const provider = session.data.provider;
+  const sdk = opensea.makeSdk(owner.wallet, session.data.chain, OPENSEA_API_KEY);
+  const openListings = await opensea.getOpenListings(sdk, owner.wallet.address, session.data.slug, session.data.contractAddress, session.data.chain);
+  const mine = openListings.filter((l) => String(l.tokenId) === String(session.data.offerTokenId));
+  for (const l of mine) await sdk.api.orders.offchainCancelOrder(l.protocolAddress, l.orderHash, session.data.chain);
+  if (mine.length > 0) bot.sendMessage(chatId, `Cancelled ${mine.length} active listing(s) first (offchain, free)`);
   bot.sendMessage(chatId, `Accepting offer ${offer.priceStr} on #${session.data.offerTokenId} (${shortAddr(owner.wallet.address)})...`);
   const out = await osoffers.acceptOffer(owner.wallet, offer, session.data.contractAddress, session.data.offerTokenId, bearer, OPENSEA_API_KEY, provider);
   if (!out.receipt || out.receipt.status !== 1) {
