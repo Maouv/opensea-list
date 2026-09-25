@@ -19,6 +19,28 @@
     ],
     "mintSig": "mintSeaDrop(address,uint256)",
     "mintName": "mintSeaDrop",
-    "status": "pending"
+    "status": "cancelled"
+  },
+  {
+    "id": "mufn17cr",
+    "chatId": 5112950656,
+    "chain": "robinhood",
+    "ca": "0x986bb18d5505b0c066e512fc2f07f5e44d785908",
+    "slug": "aura-2222",
+    "collection": "Aura",
+    "stageIndex": 0,
+    "maxPerWallet": 1,
+    "label": "Public",
+    "type": "PUBLIC_SALE",
+    "startMs": 1790334040000,
+    "endMs": 1790341240000,
+    "priceEth": 0,
+    "qty": 1,
+    "wallets": [
+      0
+    ],
+    "mintSig": "mintSeaDrop(address,uint256)",
+    "mintName": "mintSeaDrop",
+    "status": "cancelled"
   }
 ]

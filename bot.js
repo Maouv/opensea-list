@@ -23,7 +23,7 @@ const CA_REGEX = /^0x[0-9a-fA-F]{40}$/;
 const CONCURRENCY = Math.max(1, parseInt(process.env.LIST_CONCURRENCY, 10) || 3);
 const LISTING_DURATION_DAYS = 7;
 
-require('./panel/server'); // web panel — same process, shares lib/state
+
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
