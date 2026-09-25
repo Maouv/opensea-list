@@ -292,7 +292,6 @@ const server = http.createServer(async (req, res) => {
   const authed = auth === `Bearer ${PANEL_TOKEN}`;
 
   if (!url.pathname.startsWith('/api/')) {
-    if (!authed) { res.writeHead(404); return res.end('not found'); }
     let file = url.pathname === '/' ? '/index.html' : url.pathname;
     file = path.normalize(file).replace(/^(\.\.[/\\])+/, '');
     const full = path.join(PUBLIC_DIR, file);
