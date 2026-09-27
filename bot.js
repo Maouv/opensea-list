@@ -526,6 +526,12 @@ async function resolveMint(chatId, session, chainInput) {
   session.data.collection = await mint.collectionName(provider, session.data.contractAddress) || shortAddr(session.data.contractAddress);
   session.data.minted = result.minted;
 
+  // SeaDrop collections: mintPublic route (mintSeaDrop is onlySeaDrop — direct EOA call always reverts).
+  if (result.sig === 'mintSeaDrop(address,uint256)') {
+    const sd = await mint.detectSeadrop(provider, session.data.contractAddress);
+    if (sd && sd.feeRecipient) session.data.seadrop = sd;
+  }
+
   const drop = await (async () => {
     try {
       const slug = await opensea.getCollectionSlug(chainInput, session.data.contractAddress, OPENSEA_API_KEY);
@@ -555,6 +561,14 @@ async function resolveMint(chatId, session, chainInput) {
       );
     }
     session.data.dropStage = active;
+    // on-chain public drop wins over stale OS page data (price + window)
+    if (session.data.seadrop) {
+      const sd = session.data.seadrop;
+      active.priceEth = Number(ethers.formatEther(sd.price));
+      active.start = sd.start;
+      active.end = sd.end;
+      active.maxPerWallet = sd.maxPer;
+    }
     const elig = await mint.computeStageEligibility(drop, provider, session.data.contractAddress, walletWallets, session.data.mintSig, session.data.slug, OPENSEA_API_KEY);
     session.data.stageElig = elig;
     const matrix = `${session.data.collection} — drop stages:\n${mint.describeStages(drop, elig)}`;
@@ -606,13 +620,24 @@ async function askMintWallets(chatId, session) {
   if (stageElig && stageElig.reasons) {
     eligible = stageElig.reasons;
   } else if (session.data.dropStage) {
-    eligible = await mint.checkEligibility(
-      session.data.provider,
-      session.data.contractAddress,
-      walletAddresses,
-      session.data.mintSig,
-      session.data.priceWei,
-    );
+    const sd = session.data.seadrop;
+    if (sd) {
+      // real route sim: SeaDrop.mintPublic — price per on-chain drop, not stage priceEth
+      const price = session.data.priceWei;
+      const reasons = await Promise.all(walletAddresses.map(async (a) => {
+        const probe = await mint.probeSeadrop(session.data.provider, session.data.contractAddress, a, price, sd.feeRecipient, BigInt(session.data.mintQty));
+        return { minter: a, ok: !!(probe && probe.active), reason: probe && probe.reason ? probe.reason : 'mint call reverted' };
+      }));
+      eligible = reasons;
+    } else {
+      eligible = await mint.checkEligibility(
+        session.data.provider,
+        session.data.contractAddress,
+        walletAddresses,
+        session.data.mintSig,
+        session.data.priceWei,
+      );
+    }
   }
   const lines = walletAddresses.map((a, i) => {
     const bal = Number(ethers.formatEther(balances[i])).toFixed(4);
@@ -661,7 +686,7 @@ async function goToMintSummary(chatId, session, indexes) {
   });
 }
 
-async function runMint(provider, chainInput, ca, collection, mintSig, mintName, priceWei, qty, indexes, stageLabel, chatId) {
+async function runMint(provider, chainInput, ca, collection, mintSig, mintName, priceWei, qty, indexes, stageLabel, chatId, seadrop = null) {
   const iface = new ethers.Interface([`function ${mintSig} payable`]);
   const slug = mintSchedulesSlug(ca, chainInput);
   const wallets = indexes.map((i) => new ethers.Wallet(PRIVATE_KEYS[i], provider));
@@ -682,6 +707,11 @@ async function runMint(provider, chainInput, ca, collection, mintSig, mintName, 
     } else {
       throw new Error(`OS mint build: ${built.error}`);
     }
+  } else if (seadrop) {
+    const t = mint.seadropTx(ca, seadrop.feeRecipient, probeWallet.address, priceWei, qty);
+    probeData = t.data;
+    probeTo = t.to;
+    probeValue = t.value;
   } else {
     probeData = iface.encodeFunctionData(mintName, mint.mintArgs(mintSig, probeWallet.address, qty));
   }
@@ -712,6 +742,11 @@ async function runMint(provider, chainInput, ca, collection, mintSig, mintName, 
         } else {
           return { ...base, status: 'failed', error: `OS mint: ${built.error.slice(0, 120)}` };
         }
+      } else if (seadrop) {
+        const t = mint.seadropTx(ca, seadrop.feeRecipient, wallet.address, priceWei, qty);
+        txTo = t.to;
+        txData = t.data;
+        txValue = t.value;
       }
       const tx = {
         to: txTo,
@@ -791,6 +826,7 @@ async function executeMint(chatId, session) {
     indexes,
     session.data.dropStage ? session.data.dropStage.label : null,
     chatId,
+    session.data.seadrop || null,
   );
   endAndReturnToMenu(chatId, out.text.slice(0, 3900));
 }
@@ -1187,7 +1223,9 @@ async function fireSchedule(s) {
   } catch {}
   bot.sendMessage(s.chatId, `Auto-mint ${s.collection} — "${s.label}" is open! Firing ${s.wallets.length} wallet(s) × ${s.qty}...`);
   try {
-    const out = await runMint(provider, s.chain, s.ca, s.collection, s.mintSig, s.mintName, priceWei, s.qty, s.wallets, s.label, s.chatId);
+    let seadrop = null;
+    try { seadrop = await mint.detectSeadrop(provider, s.ca); } catch {}
+    const out = await runMint(provider, s.chain, s.ca, s.collection, s.mintSig, s.mintName, priceWei, s.qty, s.wallets, s.label, s.chatId, seadrop || null);
     bot.sendMessage(s.chatId, out.text.slice(0, 3900));
   } catch (err) {
     bot.sendMessage(s.chatId, `Auto-mint failed: ${err.message.slice(0, 200)}`);
@@ -1232,6 +1270,11 @@ async function handleStep(chatId, session, text) {
         return;
       }
       const check = await mint.checkWithPrice(session.data.provider, session.data.contractAddress, walletAddresses[0], session.data.mintSig, wei);
+      if (!check.active && session.data.seadrop) {
+        const probe = await mint.probeSeadrop(session.data.provider, session.data.contractAddress, walletAddresses[0], wei, session.data.seadrop.feeRecipient, 1n);
+        if (probe && probe.active) check.active = true;
+        else check.reason = probe && probe.reason ? probe.reason : check.reason;
+      }
       if (!check.active) {
         endAndReturnToMenu(chatId, `Mint still not available: ${check.reason}`);
         return;
@@ -1460,9 +1503,13 @@ async function handleStep(chatId, session, text) {
 
 bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
-  if (!isAuthorized(msg.from.id)) return;
+  if (!isAuthorized(msg.from.id)) return console.log(`start unauthorized: ${msg.from.id}`);
   if (isBusy(chatId)) return bot.sendMessage(chatId, 'Still executing, please wait until it finishes');
-  showMainMenu(chatId);
+  try {
+    showMainMenu(chatId);
+  } catch (err) {
+    console.log('start handler error:', err.message);
+  }
 });
 
 bot.onText(/\/manage-listing/, (msg) => {
@@ -1912,6 +1959,7 @@ async function handleCallback(chatId, query) {
 }
 
 bot.on('message', async (msg) => {
+  console.log(`msg received: ${msg.chat.id} ${msg.from?.id} ${String(msg.text||'').slice(0, 30)}`);
   if (!msg.text || msg.text.startsWith('/')) return;
 
   const chatId = msg.chat.id;
