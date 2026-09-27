@@ -521,6 +521,11 @@ async function resolveMint(chatId, session, chainInput) {
   const result = await mint.detect(provider, session.data.contractAddress, minter);
   console.log(`mint probe ${chainInput}:`, JSON.stringify(result, (_, v) => (typeof v === 'bigint' ? v.toString() : v)));
   if (result.error) return endAndReturnToMenu(chatId, result.error);
+  // sold-out preflight before anything else (auth/elig/broadcast all wasted on a full drop)
+  const supply = await mint.supplyCheck(provider, session.data.contractAddress);
+  if (supply && supply.soldOut) {
+    return endAndReturnToMenu(chatId, `${session.data.collection || shortAddr(session.data.contractAddress)} SOLD OUT — ${supply.total}/${supply.max} minted. Stopping early.`);
+  }
   session.data.mintSig = result.sig;
   session.data.mintName = result.name;
   session.data.collection = await mint.collectionName(provider, session.data.contractAddress) || shortAddr(session.data.contractAddress);
@@ -727,9 +732,19 @@ async function runMint(provider, chainInput, ca, collection, mintSig, mintName, 
         provider.getBalance(wallet.address),
         provider.getTransactionCount(wallet.address, 'pending'),
       ]);
-      const maxGasCost = gasLimit * (feeData.maxFeePerGas ?? feeData.gasPrice);
+      const maxGasCost = gasLimit * (feeData.maxFeePerGas ?? feeData.gasPrice) * 2n; // ×2: one 1.125-ish bump headroom
       const walletValue = priceWei * BigInt(qty);
-      if (balance < walletValue + maxGasCost) return { ...base, status: 'skipped', error: 'insufficient balance' };
+      const needed = walletValue + maxGasCost;
+      if (balance < needed) {
+        // decompose: price vs gas — tells the user WHICH knob is short (§I lesson)
+        const have = Number(ethers.formatEther(balance));
+        const needPrice = Number(ethers.formatEther(walletValue));
+        const needGas = Number(ethers.formatEther(maxGasCost));
+        const why = needPrice > 0 && have < needPrice
+          ? `balance ${have.toFixed(6)} < mint price ${needPrice.toFixed(6)}`
+          : `balance ${have.toFixed(6)} < price+gas reserve ${Number(ethers.formatEther(needed)).toFixed(6)} (price ${needPrice.toFixed(6)} + gas ${needGas.toFixed(6)})`;
+        return { ...base, status: 'skipped', error: `insufficient funds: ${why}` };
+      }
       let txTo = ca;
       let txData = iface.encodeFunctionData(mintName, mint.mintArgs(mintSig, wallet.address, qty));
       let txValue = walletValue;
@@ -769,11 +784,20 @@ async function runMint(provider, chainInput, ca, collection, mintSig, mintName, 
       const msBroadcast = Date.now() - t0;
       const receipt = await Promise.race([sent.wait(), new Promise((resolve) => setTimeout(() => resolve(null), 60000))]);
       if (!receipt) return { ...base, status: 'pending', hash: sent.hash, msBroadcast };
-      return receipt.status === 1
-        ? { ...base, status: 'ok', hash: sent.hash, msBroadcast, msConfirm: Date.now() - t0, block: receipt.blockNumber }
-        : { ...base, status: 'failed', error: 'mint reverted on-chain', msBroadcast, msConfirm: Date.now() - t0, block: receipt.blockNumber };
+      if (receipt.status === 1) return { ...base, status: 'ok', hash: sent.hash, msBroadcast, msConfirm: Date.now() - t0, block: receipt.blockNumber };
+      // revert on-chain: pull the raw revert (trace) when the RPC serves it, else generic
+      let reverted = 'mint reverted on-chain (contract rejected at block ' + receipt.blockNumber + ')';
+      try {
+        const trace = await provider.send('debug_traceTransaction', [sent.hash, { disableMemory: true, disableStack: true }]);
+        if (trace && trace.result && trace.result.output && trace.result.output !== '0x') {
+          const verdict = mint.classifyRevert(trace.result.output);
+          if (verdict && verdict.reason) reverted = `mint reverted: ${verdict.reason}`;
+        }
+      } catch {}
+      return { ...base, status: 'failed', error: reverted, msBroadcast, msConfirm: Date.now() - t0, block: receipt.blockNumber };
     } catch (err) {
-      return { ...base, status: 'failed', error: err.message.slice(0, 150) };
+      const msg = err && err.shortMessage ? err.shortMessage : err.message;
+      return { ...base, status: 'failed', error: msg.slice(0, 150) };
     }
   }));
 
