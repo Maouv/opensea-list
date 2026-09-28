@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "main": "bot.js",
   "scripts": {
-    "start": "node bot.js"
+    "start": "node bot.js",
+    "test": "node --test --test-force-exit test/mintpipe.test.js",
+    "rtt": "node scripts/rtt.js"
   },
   "type": "commonjs",
   "dependencies": {
@@ -17,3 +19,4 @@
   "author": "",
   "license": "ISC"
 }
+

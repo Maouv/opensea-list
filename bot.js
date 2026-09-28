@@ -7,6 +7,7 @@ const holdings = require('./lib/holdings');
 const sessionStore = require('./lib/session');
 const mint = require('./lib/mint');
 const minttx = require('./lib/minttx');
+const fastmint = require('./lib/fastmint');
 const schedules = require('./lib/schedules');
 const osoffers = require('./lib/osoffers');
 const osauth = require('./lib/osauth');
@@ -16,7 +17,7 @@ const path = require('path');
 function shortAddr(address) {
   return `${address.slice(0, 7)}...${address.slice(-5)}`;
 }
-const { OPENSEA_API_KEY, TELEGRAM_TOKEN, AUTHORIZED_USER_ID, PRIVATE_KEYS, providers, walletAddresses, walletWallets, fastSettings, saveFastSettings, caMemory, rememberCa, mintSchedulesSlug } = state;
+const { OPENSEA_API_KEY, TELEGRAM_TOKEN, AUTHORIZED_USER_ID, PRIVATE_KEYS, providers, RPC_ENDPOINTS, walletAddresses, walletWallets, fastSettings, saveFastSettings, caMemory, rememberCa, mintSchedulesSlug } = state;
 
 const CA_REGEX = /^0x[0-9a-fA-F]{40}$/;
 
@@ -691,120 +692,18 @@ async function goToMintSummary(chatId, session, indexes) {
   });
 }
 
-async function runMint(provider, chainInput, ca, collection, mintSig, mintName, priceWei, qty, indexes, stageLabel, chatId, seadrop = null) {
-  const iface = new ethers.Interface([`function ${mintSig} payable`]);
-  const slug = mintSchedulesSlug(ca, chainInput);
-  const wallets = indexes.map((i) => new ethers.Wallet(PRIVATE_KEYS[i], provider));
+const { prepareMint, refreshPrep, fireMint } = require('./lib/mintpipe')({ PRIVATE_KEYS, OPENSEA_API_KEY, RPC_ENDPOINTS, mintSchedulesSlug });
 
-  const [network, feeData, blockAtStart] = await Promise.all([provider.getNetwork(), provider.getFeeData(), provider.getBlockNumber()]);
-  const probeWallet = wallets[0];
-  let probeData;
-  let probeTo = ca;
-  let probeValue = priceWei * BigInt(qty);
-  let gasLimit = null;
-  if (slug && OPENSEA_API_KEY) {
-    const built = await minttx.buildTx(OPENSEA_API_KEY, slug, probeWallet.address, qty);
-    if (built.ok) {
-      probeData = built.data;
-      probeTo = built.to;
-      probeValue = built.value;
-      console.log(`mint route: os-api (slug=${slug})`);
-    } else {
-      throw new Error(`OS mint build: ${built.error}`);
-    }
-  } else if (seadrop) {
-    const t = mint.seadropTx(ca, seadrop.feeRecipient, probeWallet.address, priceWei, qty);
-    probeData = t.data;
-    probeTo = t.to;
-    probeValue = t.value;
-  } else {
-    probeData = iface.encodeFunctionData(mintName, mint.mintArgs(mintSig, probeWallet.address, qty));
-  }
-  gasLimit = await provider
-    .estimateGas({ to: probeTo, data: probeData, value: probeValue, from: probeWallet.address })
-    .then((g) => (g * 120n) / 100n)
-    .catch(() => 600000n);
-
-  const results = await Promise.all(wallets.map(async (wallet) => {
-    const base = { wallet: wallet.address };
-    try {
-      const [balance, nonce] = await Promise.all([
-        provider.getBalance(wallet.address),
-        provider.getTransactionCount(wallet.address, 'pending'),
-      ]);
-      const maxGasCost = gasLimit * (feeData.maxFeePerGas ?? feeData.gasPrice) * 2n; // ×2: one 1.125-ish bump headroom
-      const walletValue = priceWei * BigInt(qty);
-      const needed = walletValue + maxGasCost;
-      if (balance < needed) {
-        // decompose: price vs gas — tells the user WHICH knob is short (§I lesson)
-        const have = Number(ethers.formatEther(balance));
-        const needPrice = Number(ethers.formatEther(walletValue));
-        const needGas = Number(ethers.formatEther(maxGasCost));
-        const why = needPrice > 0 && have < needPrice
-          ? `balance ${have.toFixed(6)} < mint price ${needPrice.toFixed(6)}`
-          : `balance ${have.toFixed(6)} < price+gas reserve ${Number(ethers.formatEther(needed)).toFixed(6)} (price ${needPrice.toFixed(6)} + gas ${needGas.toFixed(6)})`;
-        return { ...base, status: 'skipped', error: `insufficient funds: ${why}` };
-      }
-      let txTo = ca;
-      let txData = iface.encodeFunctionData(mintName, mint.mintArgs(mintSig, wallet.address, qty));
-      let txValue = walletValue;
-      if (slug && OPENSEA_API_KEY) {
-        const built = await minttx.buildTx(OPENSEA_API_KEY, slug, wallet.address, qty);
-        if (built.ok) {
-          txTo = built.to;
-          txData = built.data;
-          txValue = built.value;
-        } else {
-          return { ...base, status: 'failed', error: `OS mint: ${built.error.slice(0, 120)}` };
-        }
-      } else if (seadrop) {
-        const t = mint.seadropTx(ca, seadrop.feeRecipient, wallet.address, priceWei, qty);
-        txTo = t.to;
-        txData = t.data;
-        txValue = t.value;
-      }
-      const tx = {
-        to: txTo,
-        data: txData,
-        value: txValue,
-        nonce,
-        chainId: network.chainId,
-        gasLimit,
-      };
-      if (feeData.maxFeePerGas) {
-        tx.type = 2;
-        tx.maxFeePerGas = feeData.maxFeePerGas;
-        tx.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas;
-      } else {
-        tx.gasPrice = feeData.gasPrice;
-      }
-      const t0 = Date.now();
-      const signed = await wallet.signTransaction(tx);
-      const sent = await provider.broadcastTransaction(signed);
-      const msBroadcast = Date.now() - t0;
-      const receipt = await Promise.race([sent.wait(), new Promise((resolve) => setTimeout(() => resolve(null), 60000))]);
-      if (!receipt) return { ...base, status: 'pending', hash: sent.hash, msBroadcast };
-      if (receipt.status === 1) return { ...base, status: 'ok', hash: sent.hash, msBroadcast, msConfirm: Date.now() - t0, block: receipt.blockNumber };
-      // revert on-chain: pull the raw revert (trace) when the RPC serves it, else generic
-      let reverted = 'mint reverted on-chain (contract rejected at block ' + receipt.blockNumber + ')';
-      try {
-        const trace = await provider.send('debug_traceTransaction', [sent.hash, { disableMemory: true, disableStack: true }]);
-        if (trace && trace.result && trace.result.output && trace.result.output !== '0x') {
-          const verdict = mint.classifyRevert(trace.result.output);
-          if (verdict && verdict.reason) reverted = `mint reverted: ${verdict.reason}`;
-        }
-      } catch {}
-      return { ...base, status: 'failed', error: reverted, msBroadcast, msConfirm: Date.now() - t0, block: receipt.blockNumber };
-    } catch (err) {
-      const msg = err && err.shortMessage ? err.shortMessage : err.message;
-      return { ...base, status: 'failed', error: msg.slice(0, 150) };
-    }
-  }));
+async function runMint(provider, chainInput, ca, collection, mintSig, mintName, priceWei, qty, indexes, stageLabel, chatId, seadrop = null, prep = null, slug = null) {
+  prep = prep || await prepareMint({ chainInput, ca, mintSig, mintName, priceWei, qty, indexes, seadrop, slug });
+  const { results, blockAtStart } = await fireMint(prep);
 
   const count = (status) => results.filter((r) => r.status === status).length;
-  let text = `Mint done — ${collection}\nBlock start: ${blockAtStart}. Success: ${count('ok')}, failed: ${count('failed')}, skipped: ${count('skipped')}, pending: ${count('pending')}`;
+  const gw = (v) => Number(ethers.formatUnits(v, 'gwei')).toFixed(3);
+  const feeTxt = prep.fee.eip1559 ? `maxFee ${gw(prep.fee.maxFeePerGas)} / tip ${gw(prep.fee.maxPriorityFeePerGas)} gwei` : `gasPrice ${gw(prep.fee.gasPrice)} gwei`;
+  let text = `Mint done — ${collection}\nRoute: ${prep.route}. Fee: ${feeTxt}. Gas limit: ${prep.gasLimit}. Block at fire: ${blockAtStart ?? '?'}. Success: ${count('ok')}, failed: ${count('failed')}, skipped: ${count('skipped')}, pending: ${count('pending')}`;
   for (const r of results) {
-    const timing = r.msBroadcast != null ? ` [${r.msBroadcast}ms broadcast${r.msConfirm != null ? `, ${r.msConfirm}ms confirmed${r.block ? `, block ${r.block}` : ''}]` : ']'}` : '';
+    const timing = r.msBroadcast != null ? ` [${r.msPrep}ms build, ${r.msBroadcast}ms send${r.msConfirm != null ? `, ${r.msConfirm}ms total${r.block ? `, block ${r.block}` : ''}` : ''}]` : '';
     text += r.hash ? `\n${shortAddr(r.wallet)}: ${r.status} ${r.hash}${timing}` : `\n${shortAddr(r.wallet)}: ${r.error}`;
   }
   const historyPath = path.join(__dirname, 'mint-history.json');
@@ -818,11 +717,13 @@ async function runMint(provider, chainInput, ca, collection, mintSig, mintName, 
     stage: stageLabel || null,
     price: ethers.formatEther(priceWei),
     qtyPerWallet: qty,
+    route: prep.route,
     blockAtStart,
     wallets: results.map((r) => ({
       addr: r.wallet,
       status: r.status,
       hash: r.hash || null,
+      msPrep: r.msPrep ?? null,
       msBroadcast: r.msBroadcast ?? null,
       msConfirm: r.msConfirm ?? null,
       block: r.block ?? null,
@@ -1234,29 +1135,79 @@ function schConfirm(chatId, session) {
   );
 }
 
+// Prewarm state per schedule: { promise, prep, priceWei, seadrop }.
+const prewarmed = new Map();
+
+async function prewarmSchedule(s) {
+  const provider = providers[s.chain];
+  if (!provider) return;
+  const entry = { promise: null, prep: null, priceWei: null, seadrop: null };
+  prewarmed.set(s.id, entry);
+  entry.promise = (async () => {
+    // re-read the live stage price + on-chain SeaDrop recon now, off the hot path
+    const [drop, seadrop] = await Promise.all([
+      mint.fetchDrop(s.slug).catch(() => null),
+      mint.detectSeadrop(provider, s.ca).catch(() => null),
+    ]);
+    let priceWei = ethers.parseEther(String(s.priceEth));
+    const st = drop && drop.stages.find((x) => x.index === s.stageIndex);
+    if (st && st.priceEth != null) priceWei = ethers.parseEther(String(st.priceEth));
+    entry.priceWei = priceWei;
+    entry.seadrop = seadrop;
+    entry.prep = await prepareMint({
+      chainInput: s.chain, ca: s.ca, mintSig: s.mintSig, mintName: s.mintName,
+      priceWei, qty: s.qty, indexes: s.wallets, seadrop, slug: s.slug,
+    });
+    console.log(`prewarm ${s.collection}: route=${entry.prep.route}, ${s.wallets.length} wallet(s) ready`);
+  })().catch((err) => {
+    entry.prep = null;
+    console.error(`prewarm ${s.collection} failed (fire will run cold):`, err.message);
+  });
+  await entry.promise;
+}
+
+async function refreshSchedule(s) {
+  const entry = prewarmed.get(s.id);
+  if (!entry) return;
+  await entry.promise;
+  if (entry.prep) await refreshPrep(entry.prep).catch((err) => console.error(`refresh ${s.collection} failed:`, err.message));
+}
+
 async function fireSchedule(s) {
   schedules.mark(s.id, 'fired');
   const provider = providers[s.chain];
   if (!provider) return bot.sendMessage(s.chatId, `Auto-mint ${s.collection}: no RPC for ${s.chain}, aborting`);
-  // price sanity: stage price at fire time (OS build also validates balance server-side)
-  let priceWei = ethers.parseEther(String(s.priceEth));
-  try {
-    const drop = await mint.fetchDrop(s.slug);
+  const entry = prewarmed.get(s.id);
+  prewarmed.delete(s.id);
+  // armed late and prewarm still running: give it a moment instead of starting a second cold prep
+  if (entry && !entry.prep) await Promise.race([entry.promise, fastmint.sleep(3000)]);
+  let prep = entry && entry.prep && Date.now() - entry.prep.preparedAt < 90000 ? entry.prep : null;
+  let priceWei = entry && entry.priceWei != null ? entry.priceWei : ethers.parseEther(String(s.priceEth));
+  let seadrop = entry ? entry.seadrop : null;
+  if (!prep) {
+    // cold path (no/failed/stale prewarm): same lookups as before but in parallel, not serial
+    const [drop, sd] = await Promise.all([
+      mint.fetchDrop(s.slug).catch(() => null),
+      mint.detectSeadrop(provider, s.ca).catch(() => null),
+    ]);
     const st = drop && drop.stages.find((x) => x.index === s.stageIndex);
     if (st && Date.now() >= st.start && Date.now() <= st.end && st.priceEth != null) priceWei = ethers.parseEther(String(st.priceEth));
-  } catch {}
-  bot.sendMessage(s.chatId, `Auto-mint ${s.collection} — "${s.label}" is open! Firing ${s.wallets.length} wallet(s) × ${s.qty}...`);
+    seadrop = sd;
+  }
   try {
-    let seadrop = null;
-    try { seadrop = await mint.detectSeadrop(provider, s.ca); } catch {}
-    const out = await runMint(provider, s.chain, s.ca, s.collection, s.mintSig, s.mintName, priceWei, s.qty, s.wallets, s.label, s.chatId, seadrop || null);
+    const run = runMint(provider, s.chain, s.ca, s.collection, s.mintSig, s.mintName, priceWei, s.qty, s.wallets, s.label, s.chatId, seadrop || null, prep, s.slug);
+    // announce AFTER the sends are in flight so Telegram never sits in front of the broadcast
+    bot.sendMessage(s.chatId, `Auto-mint ${s.collection} — "${s.label}" is open! Firing ${s.wallets.length} wallet(s) × ${s.qty}...`).catch(() => {});
+    const out = await run;
     bot.sendMessage(s.chatId, out.text.slice(0, 3900));
   } catch (err) {
     bot.sendMessage(s.chatId, `Auto-mint failed: ${err.message.slice(0, 200)}`);
   }
 }
 
-schedules.init(fireSchedule);
+schedules.init(fireSchedule, prewarmSchedule, refreshSchedule);
+// resolve chain ids once at boot so the first mint doesn't pay for eth_chainId
+Object.values(RPC_ENDPOINTS).forEach((urls) => fastmint.chainId(urls[0]).catch(() => {}));
 
 async function handleStep(chatId, session, text) {
   switch (session.step) {
@@ -2033,3 +1984,4 @@ const armed = schedules.armAll();
 if (armed > 0) console.log(`armed ${armed} mint schedule(s)`);
 
 console.log('Bot running');
+
