@@ -1,46 +1,48 @@
 [
   {
-    "id": "mufmku8v",
+    "id": "muja6d22",
     "chatId": 5112950656,
     "chain": "robinhood",
-    "ca": "0x986bb18d5505b0c066e512fc2f07f5e44d785908",
-    "slug": "aura-2222",
-    "collection": "Aura",
+    "ca": "0x741e622917a18cb5950c483b66a06e72ce8a11ca",
+    "slug": "rowdiesnft",
+    "collection": "Rowdies",
     "stageIndex": 0,
     "maxPerWallet": 1,
-    "label": "Public",
+    "label": "Rowdies Public",
     "type": "PUBLIC_SALE",
-    "startMs": 1790334040000,
-    "endMs": 1790341240000,
-    "priceEth": 0,
+    "startMs": 1790527200000,
+    "endMs": 1790530800000,
+    "priceEth": 0.0001,
     "qty": 1,
     "wallets": [
-      0
+      0,
+      1,
+      2
     ],
     "mintSig": "mintSeaDrop(address,uint256)",
     "mintName": "mintSeaDrop",
     "status": "cancelled"
   },
   {
-    "id": "mufn17cr",
+    "id": "mul4ewot",
     "chatId": 5112950656,
     "chain": "robinhood",
-    "ca": "0x986bb18d5505b0c066e512fc2f07f5e44d785908",
-    "slug": "aura-2222",
-    "collection": "Aura",
-    "stageIndex": 0,
-    "maxPerWallet": 1,
-    "label": "Public",
-    "type": "PUBLIC_SALE",
-    "startMs": 1790334040000,
-    "endMs": 1790341240000,
+    "ca": "0xb9eb38be1fd6c9f4ff99b11c0903ce107df4d4c4",
+    "slug": "west-side",
+    "collection": "WEST SIDE",
+    "stageIndex": 1,
+    "maxPerWallet": 2,
+    "label": "WEST CREW",
+    "type": "SIGNED_PRESALE",
+    "startMs": 1790604000000,
+    "endMs": 1790607600000,
     "priceEth": 0,
-    "qty": 1,
+    "qty": 2,
     "wallets": [
       0
     ],
     "mintSig": "mintSeaDrop(address,uint256)",
     "mintName": "mintSeaDrop",
-    "status": "cancelled"
+    "status": "pending"
   }
 ]
