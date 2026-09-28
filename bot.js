@@ -726,6 +726,7 @@ async function runMint(provider, chainInput, ca, collection, mintSig, mintName, 
       msPrep: r.msPrep ?? null,
       msBroadcast: r.msBroadcast ?? null,
       msConfirm: r.msConfirm ?? null,
+      sentAt: r.sentAt ?? null,
       block: r.block ?? null,
       error: r.error || null,
     })),
@@ -1174,6 +1175,7 @@ async function refreshSchedule(s) {
 }
 
 async function fireSchedule(s) {
+  const tEnter = Date.now();
   schedules.mark(s.id, 'fired');
   const provider = providers[s.chain];
   if (!provider) return bot.sendMessage(s.chatId, `Auto-mint ${s.collection}: no RPC for ${s.chain}, aborting`);
@@ -1199,7 +1201,11 @@ async function fireSchedule(s) {
     // announce AFTER the sends are in flight so Telegram never sits in front of the broadcast
     bot.sendMessage(s.chatId, `Auto-mint ${s.collection} — "${s.label}" is open! Firing ${s.wallets.length} wallet(s) × ${s.qty}...`).catch(() => {});
     const out = await run;
-    bot.sendMessage(s.chatId, out.text.slice(0, 3900));
+    // timing vs stage open (T = s.startMs), same VPS clock as the timers. Diagnostic only.
+    const sentAts = out.results.map((r) => r.sentAt).filter((v) => v != null);
+    const rel = (v) => `${v >= s.startMs ? '+' : ''}${v - s.startMs}ms`;
+    const drift = `\nTiming vs T: fire entered ${rel(tEnter)}` + (sentAts.length ? `, first send ${rel(Math.min(...sentAts))}, last send ${rel(Math.max(...sentAts))}` : ', nothing sent');
+    bot.sendMessage(s.chatId, (out.text.slice(0, 3800) + drift));
   } catch (err) {
     bot.sendMessage(s.chatId, `Auto-mint failed: ${err.message.slice(0, 200)}`);
   }

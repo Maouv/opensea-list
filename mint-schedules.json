@@ -43,6 +43,28 @@
     ],
     "mintSig": "mintSeaDrop(address,uint256)",
     "mintName": "mintSeaDrop",
+    "status": "fired"
+  },
+  {
+    "id": "mulbi69q",
+    "chatId": 5112950656,
+    "chain": "robinhood",
+    "ca": "0xb9eb38be1fd6c9f4ff99b11c0903ce107df4d4c4",
+    "slug": "west-side",
+    "collection": "WEST SIDE",
+    "stageIndex": 1,
+    "maxPerWallet": 2,
+    "label": "WEST CREW",
+    "type": "SIGNED_PRESALE",
+    "startMs": 1790607600000,
+    "endMs": 1790611200000,
+    "priceEth": 0,
+    "qty": 2,
+    "wallets": [
+      0
+    ],
+    "mintSig": "mintSeaDrop(address,uint256)",
+    "mintName": "mintSeaDrop",
     "status": "pending"
   }
 ]
