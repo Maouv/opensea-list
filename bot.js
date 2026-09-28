@@ -567,8 +567,9 @@ async function resolveMint(chatId, session, chainInput) {
       );
     }
     session.data.dropStage = active;
-    // on-chain public drop wins over stale OS page data (price + window)
-    if (session.data.seadrop) {
+    // on-chain public drop wins over stale OS page data — ONLY for the public stage.
+    // getPublicDrop describes the public stage; applying it to signed/allowlist stages corrupts their window.
+    if (session.data.seadrop && active.type === 'PUBLIC_SALE') {
       const sd = session.data.seadrop;
       active.priceEth = Number(ethers.formatEther(sd.price));
       active.start = sd.start;
@@ -625,7 +626,8 @@ async function askMintWallets(chatId, session) {
     : null;
   if (stageElig && stageElig.reasons) {
     eligible = stageElig.reasons;
-  } else if (session.data.dropStage) {
+  } else if (session.data.dropStage && session.data.dropStage.type !== 'SIGNED_PRESALE') {
+    // signed stages can't be simulated on-chain — OS eligibility only
     const sd = session.data.seadrop;
     if (sd) {
       // real route sim: SeaDrop.mintPublic — price per on-chain drop, not stage priceEth
@@ -752,7 +754,10 @@ async function executeMint(chatId, session) {
     indexes,
     session.data.dropStage ? session.data.dropStage.label : null,
     chatId,
-    session.data.seadrop || null,
+    // SeaDrop.mintPublic only works for the public stage; signed/allowlist go via the OS route
+    session.data.dropStage && session.data.dropStage.type !== 'PUBLIC_SALE' ? null : (session.data.seadrop || null),
+    null,
+    session.data.dropStage && session.data.dropStage.type !== 'PUBLIC_SALE' ? (session.data.slug || null) : null,
   );
   endAndReturnToMenu(chatId, out.text.slice(0, 3900));
 }
@@ -1990,4 +1995,3 @@ const armed = schedules.armAll();
 if (armed > 0) console.log(`armed ${armed} mint schedule(s)`);
 
 console.log('Bot running');
-

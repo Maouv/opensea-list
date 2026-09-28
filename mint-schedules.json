@@ -66,5 +66,27 @@
     "mintSig": "mintSeaDrop(address,uint256)",
     "mintName": "mintSeaDrop",
     "status": "pending"
+  },
+  {
+    "id": "mulbvkrk",
+    "chatId": 5112950656,
+    "chain": "robinhood",
+    "ca": "0xc62caba0cf5774d8e40e2651e86a0014de8ab768",
+    "slug": "kid-story-760618637",
+    "collection": "Kid Story",
+    "stageIndex": 0,
+    "maxPerWallet": 1,
+    "label": "Public stage",
+    "type": "PUBLIC_SALE",
+    "startMs": 1790712000000,
+    "endMs": 1790798400000,
+    "priceEth": 0,
+    "qty": 1,
+    "wallets": [
+      0
+    ],
+    "mintSig": "mintSeaDrop(address,uint256)",
+    "mintName": "mintSeaDrop",
+    "status": "pending"
   }
 ]
