@@ -875,6 +875,14 @@ async function startBulkOffer(chatId, session) {
     return endAndReturnToMenu(chatId, 'No active collection offer.');
   }
 
+  // a token's "own best offer" from listOffers() is often just the top collection-wide offer
+  // (valid for every token) — that's not a hidden better opportunity, it's literally one of the
+  // rows in this same checklist. Only flag exclusion for offers that AREN'T in the general
+  // collection-offer list at all (true item/trait-specific orders), so skipping a checked-off
+  // offer on purpose (e.g. choosing $4 over $5) never gets silently overridden as "excluded".
+  const rawHashSet = new Set(rawOffers.map((o) => o.hash));
+  for (const t of perToken) t.ownIsCollectionWide = rawHashSet.has(t.bestHash);
+
   session.data.bulkOffer = { perToken, rawOffers, enriched: {}, revealed: 0, selected: new Set(), pickerMsgId: loading.message_id };
   session.step = 'bulk_offer_pick';
   await revealMoreOffers(session, OF_PAGE);
@@ -938,7 +946,7 @@ async function computeAllocation(chatId, session) {
   const eligible = [];
   const excluded = [];
   for (const t of b.perToken) {
-    if (!t.bestHash || chosen.some((o) => o.hash === t.bestHash)) { eligible.push(t); continue; }
+    if (!t.bestHash || t.ownIsCollectionWide || chosen.some((o) => o.hash === t.bestHash)) { eligible.push(t); continue; }
     const sameCurrency = chosen.filter((o) => o.price.currency === t.bestCurrency);
     if (sameCurrency.length === 0) { eligible.push(t); continue; }
     const maxChosen = Math.max(...sameCurrency.map((o) => o.pricePerUnit));

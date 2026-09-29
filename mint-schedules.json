@@ -131,5 +131,27 @@
     "mintSig": "mintSeaDrop(address,uint256)",
     "mintName": "mintSeaDrop",
     "status": "fired"
+  },
+  {
+    "id": "mumc7x1d",
+    "chatId": 5112950656,
+    "chain": "robinhood",
+    "ca": "0x0b10721af018aadfbb3e31d0f4d2dea2d6bd994b",
+    "slug": "thousandart",
+    "collection": "Thousand",
+    "stageIndex": 0,
+    "maxPerWallet": 1,
+    "label": "PUBLIC",
+    "type": "PUBLIC_SALE",
+    "startMs": 1790703000000,
+    "endMs": 1790706600000,
+    "priceEth": 0,
+    "qty": 1,
+    "wallets": [
+      0
+    ],
+    "mintSig": "mintSeaDrop(address,uint256)",
+    "mintName": "mintSeaDrop",
+    "status": "cancelled"
   }
 ]
