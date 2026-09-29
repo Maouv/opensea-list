@@ -661,6 +661,37 @@ async function askMintWallets(chatId, session) {
   bot.sendMessage(chatId, `${head}${lines}\n\nWhich wallets mint? (e.g. 1,3 or all)`);
 }
 
+// Parses the "how many wallets" prompt for schedule_bulk_count. Supports:
+//   "3"      -> first 3 eligible wallets (original behavior, kept for back-compat)
+//   "2-3"    -> eligible wallets at position 2 through 3 (order shown on screen)
+//   "1,3"    -> eligible wallets at positions 1 and 3
+//   "1-2,4"  -> mix of ranges and singles
+// All numbers are 1-based positions in the ELIGIBLE list, not raw wallet numbers. Returns 0-based
+// positions into that list, or null if nothing valid was found (caller re-prompts on null).
+function parseBulkWalletSelector(text, maxN) {
+  const parts = text.split(',').map((p) => p.trim()).filter(Boolean);
+  if (parts.length === 0) return null;
+  const positions = new Set();
+  for (const part of parts) {
+    const range = part.match(/^(\d+)\s*-\s*(\d+)$/);
+    if (range) {
+      let a = Number(range[1]), b = Number(range[2]);
+      if (a > b) [a, b] = [b, a];
+      for (let i = a; i <= b; i++) positions.add(i);
+    } else if (/^\d+$/.test(part)) {
+      // a single bare number with nothing else in the list still means "first N" (old behavior);
+      // as one entry among several (e.g. "1,3") it means just that position.
+      if (parts.length === 1) { for (let i = 1; i <= Number(part); i++) positions.add(i); }
+      else positions.add(Number(part));
+    } else {
+      return null;
+    }
+  }
+  const arr = [...positions];
+  if (arr.length === 0 || arr.some((p) => !Number.isInteger(p) || p < 1 || p > maxN)) return null;
+  return arr.sort((a, b) => a - b).map((p) => p - 1);
+}
+
 function parseMintWallets(text) {
   const answer = text.trim().toLowerCase();
   if (answer === 'all') return walletAddresses.map((_, i) => i);
@@ -1589,16 +1620,20 @@ async function handleStep(chatId, session, text) {
     }
 
     case 'schedule_bulk_count': {
-      const n = parseInt(text, 10);
       const eligReasons = stageReasons(session, session.data.schStage);
       const eligIdx = eligReasons
         ? eligReasons.map((r, i) => (r.ok ? i : -1)).filter((i) => i >= 0)
         : walletAddresses.map((_, i) => i);
-      if (!Number.isInteger(n) || n < 1 || n > eligIdx.length) {
-        bot.sendMessage(chatId, `Only ${eligIdx.length}/${walletAddresses.length} wallet(s) eligible for this stage. Enter 1-${eligIdx.length}:`);
+      const positions = parseBulkWalletSelector(text, eligIdx.length);
+      if (!positions) {
+        bot.sendMessage(
+          chatId,
+          `Only ${eligIdx.length}/${walletAddresses.length} wallet(s) eligible for this stage. ` +
+            `Enter a count (e.g. 2), a range (e.g. 1-3), or a list (e.g. 1,3) — up to ${eligIdx.length}:`,
+        );
         return;
       }
-      session.data.schSel = eligIdx.slice(0, n);
+      session.data.schSel = positions.map((p) => eligIdx[p]);
       await askSchQty(chatId, session);
       break;
     }
@@ -2133,7 +2168,7 @@ async function handleCallback(chatId, query) {
     await bot.answerCallbackQuery(query.id);
     session.step = 'schedule_bulk_count';
     sessionStore.setSession(chatId, session, bot);
-    return bot.sendMessage(chatId, `How many wallets to mint? (1-${walletAddresses.length}, fills ELIGIBLE wallets in order)`);
+    return bot.sendMessage(chatId, 'How many wallets to mint? Enter a count (e.g. 2), a range (e.g. 1-3), or a list (e.g. 1,3) — fills ELIGIBLE wallets, in order shown.');
   }
 
   if (query.data === 'sch_sep') {
