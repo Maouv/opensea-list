@@ -1,29 +1,5 @@
 [
   {
-    "id": "muja6d22",
-    "chatId": 5112950656,
-    "chain": "robinhood",
-    "ca": "0x741e622917a18cb5950c483b66a06e72ce8a11ca",
-    "slug": "rowdiesnft",
-    "collection": "Rowdies",
-    "stageIndex": 0,
-    "maxPerWallet": 1,
-    "label": "Rowdies Public",
-    "type": "PUBLIC_SALE",
-    "startMs": 1790527200000,
-    "endMs": 1790530800000,
-    "priceEth": 0.0001,
-    "qty": 1,
-    "wallets": [
-      0,
-      1,
-      2
-    ],
-    "mintSig": "mintSeaDrop(address,uint256)",
-    "mintName": "mintSeaDrop",
-    "status": "cancelled"
-  },
-  {
     "id": "mul4ewot",
     "chatId": 5112950656,
     "chain": "robinhood",
@@ -65,7 +41,7 @@
     ],
     "mintSig": "mintSeaDrop(address,uint256)",
     "mintName": "mintSeaDrop",
-    "status": "pending"
+    "status": "fired"
   },
   {
     "id": "mulbvkrk",
@@ -88,5 +64,72 @@
     "mintSig": "mintSeaDrop(address,uint256)",
     "mintName": "mintSeaDrop",
     "status": "pending"
+  },
+  {
+    "id": "muleeuuk",
+    "chatId": 5112950656,
+    "chain": "ethereum",
+    "ca": "0x691bd9fd56fdd24831b3c3068d4a10ec00341e40",
+    "slug": "traceart",
+    "collection": "Trace",
+    "stageIndex": 4,
+    "maxPerWallet": 1,
+    "label": "phase 2 (FCFS)",
+    "type": "SIGNED_PRESALE",
+    "startMs": 1790619646000,
+    "endMs": 1790625046000,
+    "priceEth": 0.0033,
+    "qty": 1,
+    "wallets": [
+      0
+    ],
+    "mintSig": "mintSeaDrop(address,uint256)",
+    "mintName": "mintSeaDrop",
+    "status": "fired"
+  },
+  {
+    "id": "mulfetui",
+    "chatId": 5112950656,
+    "chain": "robinhood",
+    "ca": "0x61de0695587fbb3a602678c5ce040a040017567e",
+    "slug": "radiorelicnft",
+    "collection": "RadioRelicNFT",
+    "stageIndex": 1,
+    "maxPerWallet": 1,
+    "label": "GTD",
+    "type": "SIGNED_PRESALE",
+    "startMs": 1790611870000,
+    "endMs": 1790619070000,
+    "priceEth": 0.0002,
+    "qty": 1,
+    "wallets": [
+      1
+    ],
+    "mintSig": "mintSeaDrop(address,uint256)",
+    "mintName": "mintSeaDrop",
+    "status": "fired"
+  },
+  {
+    "id": "mulk507e",
+    "chatId": 5112950656,
+    "chain": "robinhood",
+    "ca": "0x05780625aec3b8dd36f1260c05d6d43d8040feab",
+    "slug": "hoodvandalz",
+    "collection": "Hood Vandalz",
+    "stageIndex": 0,
+    "maxPerWallet": 1,
+    "label": "Public stage",
+    "type": "PUBLIC_SALE",
+    "startMs": 1790625600000,
+    "endMs": 1790629200000,
+    "priceEth": 0,
+    "qty": 1,
+    "wallets": [
+      0,
+      1
+    ],
+    "mintSig": "mintSeaDrop(address,uint256)",
+    "mintName": "mintSeaDrop",
+    "status": "fired"
   }
 ]
