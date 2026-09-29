@@ -9,6 +9,7 @@ const mint = require('./lib/mint');
 const minttx = require('./lib/minttx');
 const fastmint = require('./lib/fastmint');
 const schedules = require('./lib/schedules');
+const dropwatch = require('./lib/dropwatch');
 const osoffers = require('./lib/osoffers');
 const osauth = require('./lib/osauth');
 const fs = require('fs');
@@ -829,14 +830,35 @@ function renderOfferTokens(chatId, session) {
 
 async function showTokenOffers(chatId, session) {
   const { chainInput, slug, offerTokenId } = session.data;
-  const offers = await osoffers.listOffersWithOrders(slug, offerTokenId, OPENSEA_API_KEY, session.data.provider);
+  const owner = session.data.owned.find((w) => w.ids.includes(offerTokenId) || w.ids.includes(String(offerTokenId)));
+  // prefetch bearer (write:orders, for cancel-listing) + open listings + NFT approval NOW, in
+  // parallel with the offer list, so tapping "Acc" later is just cancel(if any)+fulfill+sign+
+  // broadcast. Approval is the slowest part when missing (its own on-chain tx + wait), so start
+  // it here rather than after the user already picked an offer.
+  const prefetch = owner
+    ? Promise.all([
+        osauth.walletJwt(owner.wallet, ['write:orders']),
+        (async () => {
+          const sdk = opensea.makeSdk(owner.wallet, session.data.chain, OPENSEA_API_KEY);
+          return opensea.getOpenListings(sdk, owner.wallet.address, slug, session.data.contractAddress, session.data.chain);
+        })(),
+        opensea.ensureApproval(owner.wallet, session.data.contractAddress, session.data.provider, session.data.chain),
+      ]).catch((err) => {
+        console.error(`offer prefetch failed (will redo at accept time):`, err.message);
+        return null;
+      })
+    : Promise.resolve(null);
+  const [offers, prefetched] = await Promise.all([
+    osoffers.listOffersWithOrders(slug, offerTokenId, OPENSEA_API_KEY, session.data.provider),
+    prefetch,
+  ]);
   session.data.offers = offers;
+  session.data.offerPrefetch = prefetched ? { bearer: prefetched[0], openListings: prefetched[1], at: Date.now() } : null;
   if (offers.length === 0) {
     return bot.sendMessage(chatId, 'No active offers on this token.', {
       reply_markup: { inline_keyboard: [[{ text: 'Back', callback_data: 'off_back_tokens' }]] },
     });
   }
-  const owner = session.data.owned.find((w) => w.ids.includes(offerTokenId) || w.ids.includes(String(offerTokenId)));
   const lines = offers.slice(0, OF_PAGE).map((o, i) => `${i + 1}. ${o.priceStr}${o.fundable === false ? ' ⚠ no allowance' : ''}`);
   session.step = 'offer_pick';
   sessionStore.setSession(chatId, session, bot);
@@ -862,10 +884,23 @@ async function acceptOfferAt(chatId, session, i) {
   if (!(await opensea.checkStillOwned(session.data.contractAddress, session.data.offerTokenId, owner.wallet.address, session.data.provider))) {
     return endAndReturnToMenu(chatId, 'Token not owned anymore (on-chain re-check)');
   }
-  const bearer = await osauth.walletJwt(owner.wallet);
+  // reuse the prefetch from showTokenOffers if it's still fresh (<60s) — bearer, open listings,
+  // AND approval were all resolved together, so "fresh" implies approval already went through.
+  // Cold fallback re-does all three, including ensureApproval (the actual fix for
+  // TransferCallerNotOwnerNorApproved — nothing sent it before this).
+  const fresh = session.data.offerPrefetch && Date.now() - session.data.offerPrefetch.at < 60000;
+  const [bearer, openListings] = fresh
+    ? [session.data.offerPrefetch.bearer, session.data.offerPrefetch.openListings]
+    : await Promise.all([
+        osauth.walletJwt(owner.wallet, ['write:orders']),
+        (async () => {
+          const s = opensea.makeSdk(owner.wallet, session.data.chain, OPENSEA_API_KEY);
+          return opensea.getOpenListings(s, owner.wallet.address, session.data.slug, session.data.contractAddress, session.data.chain);
+        })(),
+        opensea.ensureApproval(owner.wallet, session.data.contractAddress, session.data.provider, session.data.chain),
+      ]);
   const provider = session.data.provider;
-  const sdk = opensea.makeSdk(owner.wallet, session.data.chain, OPENSEA_API_KEY);
-  const openListings = await opensea.getOpenListings(sdk, owner.wallet.address, session.data.slug, session.data.contractAddress, session.data.chain);
+  const sdk = opensea.makeSdk(owner.wallet, session.data.chain, OPENSEA_API_KEY, bearer);
   const mine = openListings.filter((l) => String(l.tokenId) === String(session.data.offerTokenId));
   for (const l of mine) await sdk.api.orders.offchainCancelOrder(l.protocolAddress, l.orderHash, session.data.chain);
   if (mine.length > 0) bot.sendMessage(chatId, `Cancelled ${mine.length} active listing(s) first (offchain, free)`);
@@ -1993,5 +2028,7 @@ bot.on('polling_error', (err) => {
 
 const armed = schedules.armAll();
 if (armed > 0) console.log(`armed ${armed} mint schedule(s)`);
+dropwatch.start(bot);
 
 console.log('Bot running');
+
