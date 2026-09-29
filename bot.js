@@ -815,7 +815,221 @@ async function offerChainPick(chatId, session, chainInput) {
   if (session.data.owned.length === 0) {
     return endAndReturnToMenu(chatId, `No ${session.data.collection} NFT in any wallet`);
   }
-  return renderOfferTokens(chatId, session);
+  return renderOfferModePick(chatId, session);
+}
+
+function renderOfferModePick(chatId, session) {
+  const totalTokens = session.data.owned.reduce((n, w) => n + w.ids.length, 0);
+  session.step = 'offer_mode_pick';
+  sessionStore.setSession(chatId, session, bot);
+  bot.sendMessage(
+    chatId,
+    `${session.data.collection} — ${session.data.owned.length} wallet(s) hold ${totalTokens} token(s) total.\n\nHow do you want to accept offers?`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: 'Bulk accept offer', callback_data: 'offmode_bulk' }],
+          [{ text: 'Separate accept offer', callback_data: 'offmode_sep' }],
+        ],
+      },
+    },
+  );
+}
+
+// ---- Bulk accept (multi-offer checklist) ----
+// Flow: scan owned tokens' own best offer (in parallel) + fetch raw collection offers (cheap,
+// one call) -> reveal/enrich offers OFF_PAGE at a time (lazy: order-detail fetch only for what's
+// shown) -> user checks off which offers to use -> allocate eligible tokens across checked
+// offers, highest per-unit price first, capped by live on-chain remaining -> fire all allocated
+// tokens in parallel -> report success/failed per offer + excluded/left-over.
+
+function fmtPerUnit(o) {
+  const v = o.pricePerUnit;
+  const s = v >= 1 ? v.toFixed(3).replace(/\.?0+$/, '') : v.toFixed(v < 0.01 ? 6 : 4).replace(/\.?0+$/, '');
+  return `${s} ${o.price.currency}/each`;
+}
+
+async function startBulkOffer(chatId, session) {
+  session.step = 'executing';
+  sessionStore.setSession(chatId, session, bot);
+  const loading = await bot.sendMessage(chatId, `Scanning ${session.data.owned.reduce((n, w) => n + w.ids.length, 0)} tokens for individual offers...`);
+
+  const [rawOffers, perToken] = await Promise.all([
+    osoffers.listCollectionOffers(session.data.slug, OPENSEA_API_KEY).catch(() => []),
+    Promise.all(
+      session.data.owned.flatMap((w) => w.ids.map(async (id) => {
+        const offers = await osoffers.listOffers(session.data.slug, id, OPENSEA_API_KEY).catch(() => []);
+        const best = offers[0] || null; // sorted desc by raw value already
+        return {
+          wallet: w.wallet,
+          tokenId: String(id),
+          bestHash: best ? best.hash : null,
+          bestValuePerUnit: best ? Number(best.price.value) / 10 ** best.price.decimals : 0,
+          bestCurrency: best ? best.price.currency : null,
+        };
+      })),
+    ),
+  ]);
+
+  if (rawOffers.length === 0) {
+    return endAndReturnToMenu(chatId, 'No active collection offer.');
+  }
+
+  session.data.bulkOffer = { perToken, rawOffers, enriched: {}, revealed: 0, selected: new Set(), pickerMsgId: loading.message_id };
+  session.step = 'bulk_offer_pick';
+  await revealMoreOffers(session, OF_PAGE);
+  sessionStore.setSession(chatId, session, bot);
+  return renderOfferPicker(chatId, session, loading.message_id, true);
+}
+
+async function revealMoreOffers(session, n) {
+  const b = session.data.bulkOffer;
+  const slice = b.rawOffers.slice(b.revealed, b.revealed + n);
+  await Promise.all(slice.map((o) => osoffers.enrichOffer(o, OPENSEA_API_KEY, session.data.provider).then(() => { b.enriched[o.hash] = o; })));
+  b.revealed += slice.length;
+}
+
+function renderOfferPicker(chatId, session, messageId, isEdit) {
+  const b = session.data.bulkOffer;
+  const shown = b.rawOffers.slice(0, b.revealed).filter((o) => b.enriched[o.hash] && !o.enrichError);
+  const totalTokens = session.data.owned.reduce((n, w) => n + w.ids.length, 0);
+
+  const lines = [`${session.data.collection} — ${totalTokens} token(s) held`, '', 'Select offers to use (tap to toggle):'];
+  const rows = shown.map((o, i) => [{
+    text: `${b.selected.has(o.hash) ? '[x]' : '[ ]'} ${i + 1}. ${fmtPerUnit(o)} — ${o.nftQty} order`,
+    callback_data: `bulkoff_tgl_${i}`,
+  }]);
+  if (b.revealed < b.rawOffers.length) rows.push([{ text: 'Load more', callback_data: 'bulkoff_more' }]);
+  rows.push([{ text: `Continue (${b.selected.size} selected)`, callback_data: 'bulkoff_continue' }, { text: 'Cancel', callback_data: 'bulkoff_cancel' }]);
+
+  const payload = { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: rows } };
+  const text = lines.join('\n');
+  return isEdit ? bot.editMessageText(text, payload) : bot.editMessageText(text, payload).catch(() => bot.sendMessage(chatId, text, { reply_markup: payload.reply_markup }));
+}
+
+async function toggleOffer(chatId, session, idx) {
+  const b = session.data.bulkOffer;
+  const shown = b.rawOffers.slice(0, b.revealed).filter((o) => b.enriched[o.hash] && !o.enrichError);
+  const o = shown[idx];
+  if (!o) return;
+  if (b.selected.has(o.hash)) b.selected.delete(o.hash); else b.selected.add(o.hash);
+  sessionStore.setSession(chatId, session, bot);
+  return renderOfferPicker(chatId, session, b.pickerMsgId, true);
+}
+
+async function loadMoreOffers(chatId, session) {
+  await revealMoreOffers(session, OF_PAGE);
+  sessionStore.setSession(chatId, session, bot);
+  return renderOfferPicker(chatId, session, session.data.bulkOffer.pickerMsgId, true);
+}
+
+// Greedily allocate eligible tokens to checked offers (highest per-unit price first), capped by
+// each offer's live on-chain remaining capacity. A token whose OWN best offer beats every checked
+// offer of the same currency is excluded (nothing here can safely compare across currencies, so
+// those are left eligible rather than guessed at).
+async function computeAllocation(chatId, session) {
+  const b = session.data.bulkOffer;
+  const chosen = [...b.selected].map((h) => b.enriched[h]).sort((x, y) => y.pricePerUnit - x.pricePerUnit);
+
+  const remainings = await Promise.all(chosen.map((o) =>
+    osoffers.getOrderRemaining(session.data.provider, o.chain, o.hash).catch(() => null)));
+  chosen.forEach((o, i) => { o.capNow = remainings[i] == null ? Number(o.nftQty) : Math.min(Number(remainings[i]), Number(o.nftQty)); });
+
+  const eligible = [];
+  const excluded = [];
+  for (const t of b.perToken) {
+    if (!t.bestHash || chosen.some((o) => o.hash === t.bestHash)) { eligible.push(t); continue; }
+    const sameCurrency = chosen.filter((o) => o.price.currency === t.bestCurrency);
+    if (sameCurrency.length === 0) { eligible.push(t); continue; }
+    const maxChosen = Math.max(...sameCurrency.map((o) => o.pricePerUnit));
+    if (t.bestValuePerUnit > maxChosen) excluded.push(t); else eligible.push(t);
+  }
+
+  const groups = chosen.map((o) => ({ offer: o, tokens: [] }));
+  let pool = eligible.slice();
+  for (const g of groups) {
+    const take = pool.splice(0, g.offer.capNow);
+    g.tokens.push(...take);
+  }
+  const leftover = pool; // eligible but no checked offer had capacity left
+
+  session.data.bulkOffer.allocation = { groups, leftover, excluded };
+  session.step = 'bulk_offer_alloc';
+  sessionStore.setSession(chatId, session, bot);
+  return renderAllocation(chatId, session);
+}
+
+function renderAllocation(chatId, session) {
+  const { groups, leftover, excluded } = session.data.bulkOffer.allocation;
+  const lines = ['Allocation preview:'];
+  for (const g of groups) lines.push(`${g.tokens.length} token${g.tokens.length === 1 ? '' : 's'} -> ${fmtPerUnit(g.offer)}`);
+  lines.push('');
+  const totalAlloc = groups.reduce((n, g) => n + g.tokens.length, 0);
+  lines.push(leftover.length === 0 ? `All ${totalAlloc} tokens covered.` : `${leftover.length} token(s) left over (no checked offer has capacity): ${leftover.map((t) => `#${t.tokenId}`).join(', ')}`);
+  lines.push('');
+  lines.push(`Excluded (better own offer elsewhere): ${excluded.length} tokens`);
+
+  const buttons = [];
+  if (excluded.length > 0) buttons.push([{ text: 'Show excluded', callback_data: 'bulkoff_excl' }]);
+  if (totalAlloc > 0) buttons.push([{ text: 'Confirm', callback_data: 'bulkoff_confirm' }, { text: 'Back to offers', callback_data: 'bulkoff_back' }, { text: 'Cancel', callback_data: 'bulkoff_cancel' }]);
+  else buttons.push([{ text: 'Back to offers', callback_data: 'bulkoff_back' }, { text: 'Cancel', callback_data: 'bulkoff_cancel' }]);
+
+  bot.sendMessage(chatId, lines.join('\n'), { reply_markup: { inline_keyboard: buttons } });
+}
+
+function renderBulkExcluded(chatId, session) {
+  const { excluded } = session.data.bulkOffer.allocation;
+  const lines = excluded.map((t) => `#${t.tokenId} — ${t.bestValuePerUnit} ${t.bestCurrency} available`);
+  bot.sendMessage(chatId, `Excluded from bulk (better own offer):\n${lines.join('\n')}\n\nThese aren't touched. Accept them individually via Separate accept offer if you want.`);
+}
+
+async function fireBulkOffer(chatId, session) {
+  const { groups, leftover, excluded } = session.data.bulkOffer.allocation;
+  session.step = 'executing';
+  sessionStore.setSession(chatId, session, bot);
+  const totalAlloc = groups.reduce((n, g) => n + g.tokens.length, 0);
+  const wallets = new Set(groups.flatMap((g) => g.tokens.map((t) => t.wallet.address)));
+  bot.sendMessage(chatId, `Accepting offer on ${totalAlloc} tokens across ${wallets.size} wallet(s)...`);
+
+  const byWallet = new Map();
+  for (const g of groups) for (const t of g.tokens) if (!byWallet.has(t.wallet.address)) byWallet.set(t.wallet.address, t.wallet);
+  const prepByWallet = new Map();
+  await Promise.all([...byWallet.values()].map(async (w) => {
+    const [bearer] = await Promise.all([
+      osauth.walletJwt(w, ['write:orders']),
+      opensea.ensureApproval(w, session.data.contractAddress, session.data.provider, session.data.chain),
+    ]).catch(() => [null]);
+    prepByWallet.set(w.address, bearer);
+  }));
+
+  const groupResults = await Promise.all(groups.map(async (g) => {
+    const results = await Promise.all(g.tokens.map(async (t) => {
+      const bearer = prepByWallet.get(t.wallet.address);
+      if (!bearer) return { tokenId: t.tokenId, wallet: t.wallet.address, status: 'failed', error: 'auth/approval failed' };
+      try {
+        const out = await osoffers.acceptOffer(t.wallet, g.offer, session.data.contractAddress, t.tokenId, bearer, OPENSEA_API_KEY, session.data.provider);
+        if (!out.receipt || out.receipt.status !== 1) {
+          return { tokenId: t.tokenId, wallet: t.wallet.address, status: 'failed', error: out.receipt ? 'reverted (order exhausted mid-batch?)' : 'pending', hash: out.hash };
+        }
+        return { tokenId: t.tokenId, wallet: t.wallet.address, status: 'ok', hash: out.hash };
+      } catch (err) {
+        return { tokenId: t.tokenId, wallet: t.wallet.address, status: 'failed', error: err.message.slice(0, 120) };
+      }
+    }));
+    return { offer: g.offer, results };
+  }));
+
+  let text = `Bulk accept done — ${session.data.collection}\n`;
+  for (const gr of groupResults) {
+    const ok = gr.results.filter((r) => r.status === 'ok').length;
+    const failed = gr.results.filter((r) => r.status === 'failed').length;
+    text += `${fmtPerUnit(gr.offer)}: success ${ok}, failed ${failed}\n`;
+  }
+  text += `Excluded: ${excluded.length}. Left over: ${leftover.length}.\n\n`;
+  for (const gr of groupResults) {
+    text += gr.results.map((r) => `${shortAddr(r.wallet)}: ${r.status} #${r.tokenId}${r.hash ? ` ${r.hash}` : ''}${r.error ? ` (${r.error})` : ''}`).join('\n') + '\n';
+  }
+  endAndReturnToMenu(chatId, text.slice(0, 3900));
 }
 
 function renderOfferTokens(chatId, session) {
@@ -1176,6 +1390,22 @@ function schConfirm(chatId, session) {
   );
 }
 
+// Match a saved schedule to its live stage without relying on positional stageIndex, which
+// shifts when OpenSea/the dev inserts a new stage earlier in the drop timeline (e.g. a new
+// FCFS phase added ahead of Public). PUBLIC_SALE is matched by type alone (a drop has at most
+// one). Non-public stages are matched by type+label, since two signed stages can share a type.
+// Falls back to stageIndex only if no type/label match is found (older schedules / edge cases).
+function matchStage(stages, s) {
+  if (s.type === 'PUBLIC_SALE') {
+    const byType = stages.find((x) => x.type === 'PUBLIC_SALE');
+    if (byType) return byType;
+  } else {
+    const byTypeLabel = stages.find((x) => x.type === s.type && x.label === s.label);
+    if (byTypeLabel) return byTypeLabel;
+  }
+  return stages.find((x) => x.index === s.stageIndex) || null;
+}
+
 // Prewarm state per schedule: { promise, prep, priceWei, seadrop }.
 const prewarmed = new Map();
 
@@ -1191,7 +1421,7 @@ async function prewarmSchedule(s) {
       mint.detectSeadrop(provider, s.ca).catch(() => null),
     ]);
     let priceWei = ethers.parseEther(String(s.priceEth));
-    const st = drop && drop.stages.find((x) => x.index === s.stageIndex);
+    const st = drop && matchStage(drop.stages, s);
     if (st && st.priceEth != null) priceWei = ethers.parseEther(String(st.priceEth));
     entry.priceWei = priceWei;
     entry.seadrop = seadrop;
@@ -1232,7 +1462,7 @@ async function fireSchedule(s) {
       mint.fetchDrop(s.slug).catch(() => null),
       mint.detectSeadrop(provider, s.ca).catch(() => null),
     ]);
-    const st = drop && drop.stages.find((x) => x.index === s.stageIndex);
+    const st = drop && matchStage(drop.stages, s);
     if (st && Date.now() >= st.start && Date.now() <= st.end && st.priceEth != null) priceWei = ethers.parseEther(String(st.priceEth));
     seadrop = sd;
   }
@@ -1764,6 +1994,77 @@ async function handleCallback(chatId, query) {
     return renderOfferTokens(chatId, session);
   }
 
+  if (query.data === 'offmode_bulk') {
+    if (session.step !== 'offer_mode_pick') return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
+    await bot.answerCallbackQuery(query.id);
+    try {
+      await startBulkOffer(chatId, session);
+    } catch (err) {
+      endAndReturnToMenu(chatId, `Bulk scan failed: ${err.message.slice(0, 200)}`);
+    }
+    return;
+  }
+
+  if (query.data === 'offmode_sep') {
+    if (session.step !== 'offer_mode_pick') return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
+    await bot.answerCallbackQuery(query.id);
+    return renderOfferTokens(chatId, session);
+  }
+
+  if (query.data.startsWith('bulkoff_tgl_')) {
+    if (session.step !== 'bulk_offer_pick' || !session.data.bulkOffer) return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
+    await bot.answerCallbackQuery(query.id);
+    return toggleOffer(chatId, session, Number(query.data.slice(12)));
+  }
+
+  if (query.data === 'bulkoff_more') {
+    if (session.step !== 'bulk_offer_pick' || !session.data.bulkOffer) return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
+    await bot.answerCallbackQuery(query.id);
+    return loadMoreOffers(chatId, session);
+  }
+
+  if (query.data === 'bulkoff_continue') {
+    if (session.step !== 'bulk_offer_pick' || !session.data.bulkOffer) return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
+    if (session.data.bulkOffer.selected.size === 0) return bot.answerCallbackQuery(query.id, { text: 'Select at least one offer' });
+    await bot.answerCallbackQuery(query.id);
+    try {
+      await computeAllocation(chatId, session);
+    } catch (err) {
+      endAndReturnToMenu(chatId, `Allocation failed: ${err.message.slice(0, 200)}`);
+    }
+    return;
+  }
+
+  if (query.data === 'bulkoff_back') {
+    if (!session.data.bulkOffer) return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
+    await bot.answerCallbackQuery(query.id);
+    session.step = 'bulk_offer_pick';
+    sessionStore.setSession(chatId, session, bot);
+    return renderOfferPicker(chatId, session, session.data.bulkOffer.pickerMsgId, false);
+  }
+
+  if (query.data === 'bulkoff_excl') {
+    if (session.step !== 'bulk_offer_alloc' || !session.data.bulkOffer?.allocation) return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
+    await bot.answerCallbackQuery(query.id);
+    return renderBulkExcluded(chatId, session);
+  }
+
+  if (query.data === 'bulkoff_confirm') {
+    if (session.step !== 'bulk_offer_alloc' || !session.data.bulkOffer?.allocation) return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
+    await bot.answerCallbackQuery(query.id);
+    try {
+      await fireBulkOffer(chatId, session);
+    } catch (err) {
+      endAndReturnToMenu(chatId, `Bulk accept failed: ${err.message.slice(0, 200)}`);
+    }
+    return;
+  }
+
+  if (query.data === 'bulkoff_cancel') {
+    await bot.answerCallbackQuery(query.id);
+    return endAndReturnToMenu(chatId, 'Bulk accept cancelled.');
+  }
+
   if (query.data === 'schd_qty') {
     if (session.step !== 'schedule_manage_detail') {
       return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
@@ -2031,4 +2332,3 @@ if (armed > 0) console.log(`armed ${armed} mint schedule(s)`);
 dropwatch.start(bot);
 
 console.log('Bot running');
-
