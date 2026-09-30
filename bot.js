@@ -18,7 +18,8 @@ const path = require('path');
 function shortAddr(address) {
   return `${address.slice(0, 7)}...${address.slice(-5)}`;
 }
-const { OPENSEA_API_KEY, TELEGRAM_TOKEN, AUTHORIZED_USER_ID, PRIVATE_KEYS, providers, RPC_ENDPOINTS, walletAddresses, walletWallets, fastSettings, saveFastSettings, caMemory, rememberCa, mintSchedulesSlug } = state;
+const { OPENSEA_API_KEY, TELEGRAM_TOKEN, AUTHORIZED_USER_ID, PRIVATE_KEYS, providers, RPC_ENDPOINTS, walletAddresses, walletWallets, fastSettings, saveFastSettings, gasSettings, saveGasSettings, caMemory, rememberCa, mintSchedulesSlug } = state;
+const gasstrategy = require('./lib/gasstrategy');
 
 const CA_REGEX = /^0x[0-9a-fA-F]{40}$/;
 
@@ -442,10 +443,23 @@ function showFastSettings(chatId) {
     const on = fastSettings.wallets[address] !== false;
     rows.push([{ text: `${shortAddr(address)}: ${on ? 'ON' : 'OFF'}`, callback_data: `setw_${i}` }]);
   });
+  rows.push([{ text: `Gas: ${gasSettings.strategy}`, callback_data: 'set_gas' }]);
   rows.push([{ text: 'Done', callback_data: 'set_done' }]);
   bot.sendMessage(chatId, 'Fast List settings — tap a wallet to toggle, price applies to every enabled wallet:', {
     reply_markup: { inline_keyboard: rows },
   });
+}
+
+function showGasSettings(chatId) {
+  const rows = Object.entries(gasstrategy.PRESETS).map(([key, p]) => [
+    { text: `${key === gasSettings.strategy ? '✓ ' : ''}${p.label}`, callback_data: `gas_${key}` },
+  ]);
+  rows.push([{ text: 'Back', callback_data: 'menu_settings' }]);
+  bot.sendMessage(
+    chatId,
+    'Gas strategy — sets the priority fee for every mint that doesn\'t have MINT_TIP_GWEI set manually in .env. Reads live fee data each time, not a fixed number:',
+    { reply_markup: { inline_keyboard: rows } },
+  );
 }
 
 function promptContract(chatId, session) {
@@ -483,7 +497,7 @@ async function startDetection(chatId, session) {
   }
 }
 
-const mintFlow = require('./lib/mintflow')({ bot, sessionStore, providers, opensea, mint, ethers, walletAddresses, walletWallets, OPENSEA_API_KEY, endAndReturnToMenu, shortAddr, PRIVATE_KEYS, RPC_ENDPOINTS, mintSchedulesSlug });
+const mintFlow = require('./lib/mintflow')({ bot, sessionStore, providers, opensea, mint, ethers, walletAddresses, walletWallets, OPENSEA_API_KEY, endAndReturnToMenu, shortAddr, PRIVATE_KEYS, RPC_ENDPOINTS, mintSchedulesSlug, gasSettings });
 
 // ---- Acc offer flow: paste CA -> owned tokens -> offers -> accept ----
 
@@ -493,7 +507,7 @@ const OF_PAGE = 5;
 const offerFlow = require('./lib/offerflow')({ bot, sessionStore, opensea, OPENSEA_API_KEY, providers, rememberCa, mint, holdings, PRIVATE_KEYS, ethers, osauth, osoffers, OF_PAGE, endAndReturnToMenu, shortAddr, detectChainHoldings });
 const bulkOffer = require('./lib/bulkoffer')({ bot, sessionStore, osoffers, osauth, opensea, OPENSEA_API_KEY, OF_PAGE, endAndReturnToMenu, shortAddr });
 
-const scheduleMod = require('./lib/schedule')({ bot, sessionStore, schedules, mint, ethers, providers, fastmint, walletAddresses, endAndReturnToMenu, shortAddr, runMint: mintFlow.runMint, prepareMint: mintFlow.prepareMint, refreshPrep: mintFlow.refreshPrep });
+const scheduleMod = require('./lib/schedule')({ bot, sessionStore, schedules, mint, ethers, providers, fastmint, walletAddresses, endAndReturnToMenu, shortAddr, runMint: mintFlow.runMint, prepareMint: mintFlow.prepareMint, refreshPrep: mintFlow.refreshPrep, estimateGasCost: mintFlow.estimateGasCost, defaultGasLimit: mintFlow.defaultGasLimit });
 
 // resolve chain ids once at boot so the first mint doesn't pay for eth_chainId
 Object.values(RPC_ENDPOINTS).forEach((urls) => fastmint.chainId(urls[0]).catch(() => {}));
@@ -948,11 +962,23 @@ async function handleCallback(chatId, query) {
     return startDetection(chatId, session);
   }
 
-  if (query.data === 'set_price' || query.data === 'set_confirm' || query.data === 'set_done' || query.data.startsWith('setw_')) {
+  if (query.data === 'set_price' || query.data === 'set_confirm' || query.data === 'set_done' || query.data === 'set_gas' || query.data.startsWith('setw_') || query.data.startsWith('gas_')) {
     if (!session || session.step !== 'awaiting_settings') {
       return bot.answerCallbackQuery(query.id, { text: 'Button no longer valid' });
     }
     await bot.answerCallbackQuery(query.id);
+
+    if (query.data === 'set_gas') {
+      return showGasSettings(chatId);
+    }
+
+    if (query.data.startsWith('gas_')) {
+      const strategy = query.data.slice(4);
+      if (!gasstrategy.PRESETS[strategy]) return bot.answerCallbackQuery(query.id, { text: 'Unknown preset' });
+      gasSettings.strategy = strategy;
+      saveGasSettings();
+      return showFastSettings(chatId);
+    }
 
     if (query.data === 'set_price') {
       session.step = 'awaiting_settings_price';
@@ -1349,3 +1375,4 @@ if (armed > 0) console.log(`armed ${armed} mint schedule(s)`);
 dropwatch.start(bot);
 
 console.log('Bot running');
+

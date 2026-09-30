@@ -22,51 +22,6 @@
     "status": "cancelled"
   },
   {
-    "id": "muleeuuk",
-    "chatId": 5112950656,
-    "chain": "ethereum",
-    "ca": "0x691bd9fd56fdd24831b3c3068d4a10ec00341e40",
-    "slug": "traceart",
-    "collection": "Trace",
-    "stageIndex": 4,
-    "maxPerWallet": 1,
-    "label": "phase 2 (FCFS)",
-    "type": "SIGNED_PRESALE",
-    "startMs": 1790619646000,
-    "endMs": 1790625046000,
-    "priceEth": 0.0033,
-    "qty": 1,
-    "wallets": [
-      0
-    ],
-    "mintSig": "mintSeaDrop(address,uint256)",
-    "mintName": "mintSeaDrop",
-    "status": "fired"
-  },
-  {
-    "id": "mulk507e",
-    "chatId": 5112950656,
-    "chain": "robinhood",
-    "ca": "0x05780625aec3b8dd36f1260c05d6d43d8040feab",
-    "slug": "hoodvandalz",
-    "collection": "Hood Vandalz",
-    "stageIndex": 0,
-    "maxPerWallet": 1,
-    "label": "Public stage",
-    "type": "PUBLIC_SALE",
-    "startMs": 1790625600000,
-    "endMs": 1790629200000,
-    "priceEth": 0,
-    "qty": 1,
-    "wallets": [
-      0,
-      1
-    ],
-    "mintSig": "mintSeaDrop(address,uint256)",
-    "mintName": "mintSeaDrop",
-    "status": "fired"
-  },
-  {
     "id": "mumc7x1d",
     "chatId": 5112950656,
     "chain": "robinhood",
@@ -132,6 +87,6 @@
     ],
     "mintSig": "mintSeaDrop(address,uint256)",
     "mintName": "mintSeaDrop",
-    "status": "pending"
+    "status": "cancelled"
   }
 ]
